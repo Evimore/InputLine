@@ -12,6 +12,7 @@
 
 #ifndef _WIN32
   #include <sys/stat.h>
+  #include <unistd.h>
 #endif
 
 namespace inputline {
@@ -51,6 +52,11 @@ namespace inputline {
     const char *base = std::getenv("ProgramData");
     return (std::filesystem::path(base && *base ? base : "C:\\ProgramData") / "InputLine" / "pairing" / "inputline-host.conf").string();
 #else
+    // As root (the service, or sudo): next to the service's other files, so
+    // 'sudo inputline-host clients' sees the service's pairings.
+    if (::geteuid() == 0) {
+      return "/var/lib/inputline/pairing/inputline-host.conf";
+    }
     return (config_dir("InputLine") / "inputline-host.conf").string();
 #endif
   }

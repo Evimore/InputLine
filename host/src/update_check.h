@@ -37,7 +37,7 @@ namespace inputline::update {
    */
   std::optional<Release> newer_release(const std::vector<Release> &releases, const std::string &current);
 
-  /** Download the release list (Windows; elsewhere always empty). */
+  /** Download the release list (WinHTTP on Windows, curl elsewhere); empty if it can't. */
   std::optional<std::string> fetch_releases_json(const std::string &user_agent);
 
   /** Checks in the background: shortly after start, then once a day. */

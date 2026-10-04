@@ -13,7 +13,7 @@ Steam Link is the only streaming app that brings the Steam Controller across wit
 
 - **Everything Steam Input offers:** both trackpads with pressure and haptics, gyro, the four back buttons, capacitive sticks and grips, and your per-game layouts.
 - **Works with any streaming app and host:** Moonlight with Sunshine, Apollo or Vibepollo, unmodified.
-- **Easy to live with:** the PC side is a Windows installer that runs in the background; the app finds your PC on the network and reconnects the controller by itself.
+- **Easy to live with:** the PC side runs in the background (a Windows installer, or one command on Linux); the app finds your PC on the network and reconnects the controller by itself.
 - **Free and open source.**
 
 > **Status: public beta.** It works end to end on one setup so far: a 2026 Steam Controller, an iPad and a Windows 11 PC. Steam shows full Steam Input, every input works, and it feels the same as Steam Link. iPhone, Apple TV (through an iPhone) and Windows 10 haven't been tested yet. If you try InputLine, please [say how it went](../../issues/new/choose), whether it worked or not. The app isn't on the App Store yet, so you install it yourself (free, from Windows). See the [roadmap](docs/roadmap.md).
@@ -33,7 +33,7 @@ Steam Link is the only streaming app that brings the Steam Controller across wit
 
 - A **2026 Steam Controller**
 - An **iPad or iPhone** with iOS 15 or later (for Apple TV, see [below](#apple-tv))
-- A **Windows 10 (1809+) or 11 PC** with Steam, and a streaming host such as [Sunshine](https://github.com/LizardByte/Sunshine), [Apollo](https://github.com/ClassicOldSong/Apollo) or [Vibepollo](https://github.com/Nonary/Vibepollo)
+- A **Windows 10 (1809+) or 11 PC**, or a **Linux PC** (CachyOS, Arch, Ubuntu, Fedora...), with Steam, and a streaming host such as [Sunshine](https://github.com/LizardByte/Sunshine), [Apollo](https://github.com/ClassicOldSong/Apollo) or [Vibepollo](https://github.com/Nonary/Vibepollo)
 - A streaming app on the iPad or iPhone, such as [Moonlight](https://moonlight-stream.org)
 
 ## Get started
@@ -48,6 +48,8 @@ The order doesn't matter: the installer's last screen says whether usbip-win2 is
 > If Windows' **Smart App Control** is on, it blocks part of usbip-win2 and Steam never sees the controller. See [Troubleshooting](docs/host-setup-windows.md#troubleshooting).
 
 That's all on the PC. InputLine now runs in the background and starts with Windows. More in the [Windows setup guide](docs/host-setup-windows.md).
+
+**On Linux:** install `usbip` and Avahi, then run `sudo ./inputline-host install` from the Linux download. It sets InputLine up as a background service the same way. Step by step: [Linux setup](docs/host-setup-linux.md).
 
 ### 2. Install the app
 
@@ -100,6 +102,7 @@ It will be. Until then, a free Apple ID lets you install it yourself; see [Insta
 ## Documentation
 
 - [Windows setup](docs/host-setup-windows.md): the installer, settings and troubleshooting
+- [Linux setup](docs/host-setup-linux.md): CachyOS, Arch and other distributions
 - [Install InputLine](docs/install-app.md): sideloading, updates, Apple TV
 - [Checking smoothness](docs/timing.md): timing statistics on the device and the PC
 - [Architecture](docs/architecture.md) and [link protocol](docs/protocol.md)
@@ -110,7 +113,7 @@ It will be. Until then, a free Apple ID lets you install it yourself; see [Insta
 | Component | What it does |
 |---|---|
 | [`core/`](core) | Portable C++17, no dependencies. Controller report layouts, Bluetooth → wired report conversion, Steam's identity handshake, the authenticated link protocol, timing statistics. |
-| [`host/`](host) | `inputline-host`: the link server plus a small USB/IP device server that exports a virtual `28DE:1302` Steam Controller, which usbip-win2 (Windows) or vhci-hcd (Linux) attaches. Runs as a Windows service. `inputline-sim` stands in for the app when testing. |
+| [`host/`](host) | `inputline-host`: the link server plus a small USB/IP device server that exports a virtual `28DE:1302` Steam Controller, which usbip-win2 (Windows) or vhci-hcd (Linux) attaches. Runs as a Windows or systemd service. `inputline-sim` stands in for the app when testing. |
 | [`clients/inputline-ios/`](clients/inputline-ios) | The InputLine app for iPad and iPhone. |
 | [`clients/apple-shared/`](clients/apple-shared) | CoreBluetooth driver for Valve's controller protocol, with background state restoration. |
 | [`installer/windows/`](installer/windows) | The WiX installer. |
@@ -121,7 +124,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-This builds on Windows (MSVC), Linux and macOS; Linux hosts work too (load `vhci-hcd`, install `usbip`, run `inputline-host` as root). CI tests everything on every push, including the installer on Windows and the whole path through Linux's USB/IP and SDL's Steam Controller driver. See [CONTRIBUTING.md](CONTRIBUTING.md), which also explains how releases are made.
+This builds on Windows (MSVC), Linux and macOS. CI tests everything on every push, including the installer on Windows, installing and pairing through the Linux service, and the whole path through Linux's USB/IP and SDL's Steam Controller driver. See [CONTRIBUTING.md](CONTRIBUTING.md), which also explains how releases are made.
 
 ## Credits
 

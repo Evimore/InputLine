@@ -32,17 +32,19 @@ namespace inputline {
   struct UsbipCheck {
     enum class State {
       kOk,
-      kMissing,
-      kTooOld,
+      kMissing,   ///< no usbip-win2 (Windows) or usbip tool (Linux)
+      kTooOld,    ///< usbip-win2 older than kMinUsbipVersion
+      kNoDriver,  ///< Linux: the vhci-hcd kernel module isn't loaded
     };
     State state = State::kOk;
     std::string version;  ///< e.g. "0.9.8.1", when known
   };
 
   /**
-   * @brief Whether usbip-win2 is installed and new enough (Windows).
-   * @param executable The configured usbip.exe, or empty for the default.
-   * Elsewhere always kOk: Linux's usbip comes with the system.
+   * @brief Whether the system can attach the virtual controller: usbip-win2
+   *        installed and new enough (Windows), or the usbip tool installed and
+   *        the vhci-hcd kernel module loaded (Linux).
+   * @param executable The configured usbip executable, or empty for the default.
    */
   UsbipCheck check_usbip(const std::string &executable);
 
@@ -55,8 +57,14 @@ namespace inputline {
   /**
    * @brief Run a program with arguments (no shell).
    * @param output If given, receives what the program wrote to stdout and stderr.
+   * @param max_output Keep at most this many bytes of output.
    * @return Its exit code, or -1 if it could not start.
    */
-  int run_process(const std::vector<std::string> &argv, std::string *output = nullptr);
+  int run_process(const std::vector<std::string> &argv, std::string *output = nullptr, std::size_t max_output = 16384);
+
+#ifndef _WIN32
+  /** The full path of @p program on the PATH, or empty if it isn't there. */
+  std::string find_program(const std::string &program);
+#endif
 
 }  // namespace inputline

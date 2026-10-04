@@ -6,7 +6,7 @@ The same app runs on iPad and iPhone (iOS / iPadOS 15 or later).
 
 ## What you need
 
-- A Windows PC, usually the one you stream from.
+- A Windows PC, usually the one you stream from. (Sideloadly also runs on macOS. From Linux, use a Linux sideloading tool, or sideload from any Windows or Mac.)
 - An Apple ID. A free one works, with limits (see [Free Apple ID limits](#free-apple-id-limits)).
 - A USB cable, for the first install.
 - The PC side set up first: [Windows host setup](host-setup-windows.md).

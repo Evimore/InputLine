@@ -295,6 +295,88 @@ jobs:
           path: screenshots
           if-no-files-found: error
 
+  linux-service:
+    name: Linux service (install, pair, attach, uninstall)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install usbip, Avahi and ufw
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" "linux-tools-$(uname -r)" linux-tools-common \
+            avahi-daemon avahi-utils libnotify-bin ufw usbutils
+          sudo systemctl start avahi-daemon
+          sudo ufw --force enable
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINPUTLINE_BUILD_TESTS=OFF
+          cmake --build build -j
+      - name: Install as a service
+        run: |
+          sudo ./build/host/inputline-host install | tee "$RUNNER_TEMP/install.txt"
+          systemctl is-active --quiet inputline
+          systemctl is-enabled --quiet inputline
+          test -x /usr/local/bin/inputline-host
+          test -f /etc/inputline/options.txt
+          grep -q vhci-hcd /etc/modules-load.d/inputline.conf
+          grep -q 28de /etc/udev/rules.d/70-inputline.rules
+          lsmod | grep -q vhci_hcd
+          sudo ufw status | tee "$RUNNER_TEMP/ufw.txt"
+          grep -q "48150/udp" "$RUNNER_TEMP/ufw.txt"
+          # The service writes its status every 2 s.
+          for i in $(seq 1 15); do inputline-host status && break; sleep 1; done
+          inputline-host status | grep -q "usbip: ready"
+      - name: Found on the network (Avahi)
+        run: |
+          for i in $(seq 1 15); do
+            avahi-browse --resolve --parsable --terminate _inputline._udp | tee "$RUNNER_TEMP/avahi.txt"
+            grep -q ";48150;" "$RUNNER_TEMP/avahi.txt" && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: Pair through the service, like the app
+        run: |
+          mkfifo "$RUNNER_TEMP/pin"
+          ./build/host/inputline-sim --state "$RUNNER_TEMP/sim.pairing" pair < "$RUNNER_TEMP/pin" > "$RUNNER_TEMP/pair.txt" 2>&1 &
+          exec 3> "$RUNNER_TEMP/pin"
+          # The code pops up as a notification and goes to the journal.
+          code=""
+          for i in $(seq 1 15); do
+            code=$(sudo journalctl -u inputline --no-pager | grep -o "pairing code for 'inputline-sim': [0-9]*" | tail -n 1 | grep -o "[0-9]*$" || true)
+            [ -n "$code" ] && break
+            sleep 1
+          done
+          test -n "$code"
+          echo "$code" >&3
+          exec 3>&-
+          wait
+          cat "$RUNNER_TEMP/pair.txt"
+          sudo inputline-host clients | grep -q inputline-sim
+      - name: Stream and attach
+        run: |
+          ./build/host/inputline-sim --state "$RUNNER_TEMP/sim.pairing" run 40 > "$RUNNER_TEMP/sim.log" 2>&1 &
+          for i in $(seq 1 20); do inputline-host status | grep -q "1 controller" && break; sleep 1; done
+          inputline-host status
+          inputline-host status | grep -q "Connected: inputline-sim, 1 controller"
+          for i in $(seq 1 10); do lsusb -d 28de:1302 && break; sleep 1; done
+          lsusb -d 28de:1302
+      - name: Uninstall
+        run: |
+          sudo inputline-host uninstall
+          ! systemctl is-active --quiet inputline
+          test ! -e /etc/systemd/system/inputline.service
+          test ! -e /usr/local/bin/inputline-host
+          test ! -e /etc/udev/rules.d/70-inputline.rules
+          ! sudo ufw status | grep -q "48150/udp"
+          sudo test -f /var/lib/inputline/pairing/inputline-host.conf
+      - name: Logs
+        if: always()
+        run: |
+          echo "--- install"; cat "$RUNNER_TEMP/install.txt" || true
+          echo "--- journal"; sudo journalctl -u inputline --no-pager | tail -n 80 || true
+          echo "--- sim"; cat "$RUNNER_TEMP/sim.log" || true
+          echo "--- usbip port"; sudo usbip port || true
+
   usbip-end-to-end:
     name: End to end (Linux vhci-hcd + SDL)
     runs-on: ubuntu-24.04

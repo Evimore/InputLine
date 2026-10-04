@@ -3,6 +3,8 @@
 #include "log.h"
 #include "inputline/version.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -64,8 +66,40 @@ namespace inputline {
     return check;
   }
 #else
-  UsbipCheck check_usbip(const std::string &) {
+  std::string find_program(const std::string &program) {
+    if (program.find('/') != std::string::npos) {
+      return ::access(program.c_str(), X_OK) == 0 ? program : std::string();
+    }
+    // A service's PATH can be short: also look where distributions put it.
+    std::string path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    path += ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    std::size_t start = 0;
+    while (start <= path.size()) {
+      const std::size_t end = std::min(path.find(':', start), path.size());
+      const std::string dir = path.substr(start, end - start);
+      if (!dir.empty()) {
+        const std::string candidate = dir + "/" + program;
+        if (::access(candidate.c_str(), X_OK) == 0) {
+          return candidate;
+        }
+      }
+      start = end + 1;
+    }
     return {};
+  }
+
+  UsbipCheck check_usbip(const std::string &executable) {
+    UsbipCheck check;
+    if (find_program(executable.empty() ? default_usbip_executable() : executable).empty()) {
+      check.state = UsbipCheck::State::kMissing;
+      return check;
+    }
+    std::error_code error;
+    if (!std::filesystem::exists("/sys/devices/platform/vhci_hcd.0", error) &&
+        !std::filesystem::exists("/sys/bus/platform/drivers/vhci_hcd", error)) {
+      check.state = UsbipCheck::State::kNoDriver;
+    }
+    return check;
   }
 #endif
 
@@ -131,7 +165,12 @@ namespace inputline {
     }
 #endif
     if (code != 0) {
-      log::error("attach: '", argv[0], "' failed (exit ", code, "). Is usbip-win2 installed, and does InputLine run as administrator/root?");
+#ifdef _WIN32
+      log::error("attach: '", argv[0], "' failed (exit ", code, "). Is usbip-win2 installed, and does InputLine run as administrator?");
+#else
+      log::error("attach: '", argv[0], "' failed (exit ", code, "). Is usbip installed, is the vhci-hcd module loaded (sudo modprobe vhci-hcd), "
+                 "and does InputLine run as root?");
+#endif
       return false;
     }
     log::info("attach: plugged in ", busid);
@@ -180,7 +219,7 @@ namespace inputline {
     }
   }  // namespace
 
-  int run_process(const std::vector<std::string> &argv, std::string *output) {
+  int run_process(const std::vector<std::string> &argv, std::string *output, std::size_t max_output) {
     if (argv.empty()) {
       return -1;
     }
@@ -233,8 +272,8 @@ namespace inputline {
       char buffer[512];
       DWORD got = 0;
       while (ReadFile(read_end, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
-        if (output->size() < 16384) {
-          output->append(buffer, got);
+        if (output->size() < max_output) {
+          output->append(buffer, std::min(static_cast<std::size_t>(got), max_output - output->size()));
         }
       }
       CloseHandle(read_end);
@@ -247,7 +286,7 @@ namespace inputline {
     return static_cast<int>(exit_code);
   }
 #else
-  int run_process(const std::vector<std::string> &argv, std::string *output) {
+  int run_process(const std::vector<std::string> &argv, std::string *output, std::size_t max_output) {
     if (argv.empty()) {
       return -1;
     }
@@ -285,8 +324,8 @@ namespace inputline {
       char buffer[512];
       ssize_t got = 0;
       while ((got = ::read(pipe_fds[0], buffer, sizeof(buffer))) > 0) {
-        if (output->size() < 16384) {
-          output->append(buffer, static_cast<std::size_t>(got));
+        if (output->size() < max_output) {
+          output->append(buffer, std::min(static_cast<std::size_t>(got), max_output - output->size()));
         }
       }
       ::close(pipe_fds[0]);

@@ -11,6 +11,8 @@
   #include <windows.h>
 
   #include <winhttp.h>
+#else
+  #include "usbip_attach.h"  // run_process, find_program
 #endif
 
 namespace inputline::update {
@@ -364,8 +366,21 @@ namespace inputline::update {
     return result;
   }
 #else
-  std::optional<std::string> fetch_releases_json(const std::string &) {
-    return std::nullopt;
+  std::optional<std::string> fetch_releases_json(const std::string &user_agent) {
+    // curl is on practically every Linux system (pacman itself needs it).
+    const std::string curl = find_program("curl");
+    if (curl.empty()) {
+      return std::nullopt;
+    }
+    const std::string url = std::string("https://api.github.com/repos/") + kRepository + "/releases?per_page=20";
+    std::string output;
+    const int code = run_process({curl, "--silent", "--fail", "--location", "--max-time", "30", "--user-agent", user_agent, "--header",
+                                  "Accept: application/vnd.github+json", url},
+                                 &output, 4 * 1024 * 1024);
+    if (code != 0 || output.empty()) {
+      return std::nullopt;
+    }
+    return output;
   }
 #endif
 

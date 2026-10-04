@@ -4,8 +4,9 @@
  *        can list the PC instead of asking for its address.
  *
  * The PC is registered as a DNS-SD service of type `_inputline._udp` through
- * the operating system's own mDNS responder (Windows 10 1809 and later).
- * Elsewhere, start() returns false and clients enter the address by hand.
+ * the operating system's own mDNS responder: Windows' (10 1809 and later), or
+ * Avahi on Linux (through avahi-publish). Without one, clients enter the
+ * address by hand.
  */
 #pragma once
 

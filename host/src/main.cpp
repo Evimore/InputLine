@@ -37,6 +37,10 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
+
 #ifndef INPUTLINE_VERSION
   #define INPUTLINE_VERSION "dev"
 #endif
@@ -82,12 +86,18 @@ namespace {
       "  run              Serve paired clients (default). An unpaired iPad / iPhone\n"
       "                   can ask to pair: a code pops up on this PC's screen.\n"
       "  pair             Like run, and show a pairing code right away.\n"
-      "  service          How Windows starts the InputLine service the installer\n"
-      "                   sets up. Extra options go in %s\\options.txt.\n"
+      "  service          How the background service starts it. Extra options go\n"
+      "                   in %s.\n"
+#ifdef _WIN32
       "  install          (Without the installer; as administrator) Start at every\n"
       "                   logon in the background, and allow the link through the\n"
       "                   firewall.\n"
+#else
+      "  install          (As root) Set up the background service: systemd, the\n"
+      "                   vhci-hcd module, Steam's access, and the firewall.\n"
+#endif
       "  uninstall        Undo install. Paired devices are kept.\n"
+      "  status           What the background service is doing.\n"
       "  clients          List paired clients.\n"
       "  forget <id>      Remove a paired client.\n"
       "  demo [seconds]   Plug in one virtual controller driven by a test pattern,\n"
@@ -113,7 +123,7 @@ namespace {
       "  --hide-console   Run without a console window\n"
       "  --verbose        Debug logging\n"
       "  --version        Print the version\n",
-      desktop::data_dir().empty() ? "(Windows only)" : desktop::data_dir().c_str(),
+      desktop::options_path().c_str(),
       link::kDefaultPort,
       usbip::kDefaultPort,
       ClientStore::default_path().c_str()
@@ -257,10 +267,11 @@ namespace {
   std::string computer_name() {
 #ifdef _WIN32
     const char *name = std::getenv("COMPUTERNAME");
-#else
-    const char *name = std::getenv("HOSTNAME");
-#endif
     return name && *name ? name : "PC";
+#else
+    char name[256] = {};
+    return ::gethostname(name, sizeof(name) - 1) == 0 && name[0] != '\0' ? std::string(name) : "PC";
+#endif
   }
 
   bool valid_pin(const std::string &pin) {
@@ -287,8 +298,26 @@ namespace {
     out << line << "\n";
   }
 
-  /** Log usbip-win2's state and, if something is wrong, say so on screen. */
+  /** Log usbip's state and, if something is wrong, say so on screen. */
   void report_usbip(const UsbipCheck &usbip) {
+#ifndef _WIN32
+    switch (usbip.state) {
+      case UsbipCheck::State::kOk:
+        log::info("usbip and vhci-hcd are ready");
+        break;
+      case UsbipCheck::State::kMissing:
+      case UsbipCheck::State::kTooOld:
+        log::warn("usbip isn't installed: InputLine can't plug controllers in. Install it: ", desktop::install_hint(desktop::Package::kUsbip));
+        desktop::show_notification("InputLine needs usbip", "It plugs the controller into this PC. Install it: " + desktop::install_hint(desktop::Package::kUsbip));
+        break;
+      case UsbipCheck::State::kNoDriver:
+        log::warn("the vhci-hcd kernel module isn't loaded: InputLine can't plug controllers in. Try: sudo modprobe vhci-hcd");
+        desktop::show_notification("InputLine needs the vhci-hcd kernel module",
+                                   "It plugs the controller into this PC. Try: sudo modprobe vhci-hcd. If that fails, your kernel doesn't include it.");
+        break;
+    }
+    return;
+#endif
     switch (usbip.state) {
       case UsbipCheck::State::kOk:
         log::info("usbip-win2 ", usbip.version.empty() ? std::string("is installed") : usbip.version + " is installed");
@@ -305,6 +334,8 @@ namespace {
                                    "You have " + usbip.version + "; InputLine needs " + kMinUsbipVersion + " or newer. Click to download it.",
                                    kUsbipDownloadUrl);
         break;
+      case UsbipCheck::State::kNoDriver:
+        break;  // Linux only
     }
   }
 
@@ -367,10 +398,62 @@ namespace {
     return out;
   }
 
+  /** 'status': what the background service wrote to its status file. */
+  int show_status() {
+    const std::string path = desktop::data_file("status.txt");
+    const auto status = path.empty() ? std::nullopt : read_status_file(path);
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    if (!status || now - status->time > 15 || status->time - now > 15) {
+      std::printf("The InputLine service isn't running.\n");
+#ifdef _WIN32
+      std::printf("Start it from Terminal (Admin): Start-Service InputLine\n");
+#else
+      std::printf("Start it: sudo systemctl start inputline    (log: journalctl -u inputline)\n");
+#endif
+      return 1;
+    }
+    std::printf("InputLine %s is running\n", status->version.c_str());
+    if (status->devices.empty()) {
+      std::printf("  No InputLine app connected\n");
+    } else {
+      std::string devices;
+      for (const auto &device : status->devices) {
+        devices += (devices.empty() ? "" : ", ") + device;
+      }
+      std::printf("  Connected: %s, %zu controller(s) plugged in\n", devices.c_str(), status->controllers);
+    }
+#ifdef _WIN32
+    const char *driver = "usbip-win2";
+#else
+    const char *driver = "usbip";
+#endif
+    if (status->usbip == "ok") {
+      std::printf("  %s: ready\n", driver);
+    } else if (status->usbip == "nodriver") {
+      std::printf("  The vhci-hcd kernel module isn't loaded: try sudo modprobe vhci-hcd\n");
+    } else if (status->usbip == "old") {
+      std::printf("  %s %s is too old: get %s or newer from %s\n", driver, status->usbip_version.c_str(), kMinUsbipVersion, kUsbipDownloadUrl);
+    } else {
+#ifdef _WIN32
+      std::printf("  usbip-win2 isn't installed: get it from %s\n", kUsbipDownloadUrl);
+#else
+      std::printf("  usbip isn't installed: %s\n", desktop::install_hint(desktop::Package::kUsbip).c_str());
+#endif
+    }
+    if (!status->update_version.empty()) {
+      std::printf("  InputLine %s is available: %s\n", status->update_version.c_str(), status->update_url.c_str());
+    }
+    return 0;
+  }
+
   int list_clients(ClientStore &store) {
     const auto clients = store.list();
     if (clients.empty() && !desktop::data_dir().empty() && !desktop::is_elevated()) {
+#ifdef _WIN32
       std::printf("Paired devices are only readable from an administrator terminal (Terminal (Admin)).\n");
+#else
+      std::printf("Paired devices are only readable as root: sudo inputline-host clients\n");
+#endif
       return 1;
     }
     if (clients.empty()) {
@@ -442,6 +525,9 @@ namespace {
     if (args.command == "uninstall") {
       return desktop::uninstall();
     }
+    if (args.command == "status") {
+      return show_status();
+    }
     if (!net::startup()) {
       log::error("network startup failed");
       return 1;
@@ -502,8 +588,13 @@ namespace {
     auto server = std::make_unique<LinkServer>(options, store, backend);
     if (!server->start()) {
       if (desktop::service_installed() && args.command != "service") {
+#ifdef _WIN32
         log::error("the InputLine service already runs in the background: there is nothing to start. "
                    "To run it in this window instead, first stop the service (Stop-Service InputLine).");
+#else
+        log::error("the InputLine service already runs in the background: there is nothing to start. "
+                   "To run it here instead, first stop the service (sudo systemctl stop inputline).");
+#endif
       } else {
         log::error("is inputline-host already running (for example installed with 'inputline-host install')? "
                    "Then there is nothing to start: pair by tapping Connect in InputLine.");
@@ -534,7 +625,7 @@ namespace {
 
     // As a service: the tray icon, its status file, and the daily update check.
     const bool service = args.command == "service";
-    const std::string status_path = desktop::data_dir().empty() ? std::string() : desktop::data_dir() + "\\status.txt";
+    const std::string status_path = desktop::data_file("status.txt");
     update::Checker updates(INPUTLINE_VERSION);
     if (service) {
       tray::start_agents();
@@ -542,7 +633,7 @@ namespace {
         updates.start();
       }
     }
-    std::string update_announced = read_first_line(desktop::data_dir() + "\\update-notified.txt");
+    std::string update_announced = read_first_line(desktop::data_file("update-notified.txt"));
 
     log::info("ready: ", store.list().size(), " paired client(s). Press Ctrl+C to stop.");
     auto next_status = std::chrono::steady_clock::now();
@@ -570,7 +661,10 @@ namespace {
       status.time = static_cast<std::int64_t>(std::time(nullptr));
       status.controllers = link.controllers;
       status.devices = link.clients;
-      status.usbip = usbip.state == UsbipCheck::State::kOk ? "ok" : usbip.state == UsbipCheck::State::kMissing ? "missing" : "old";
+      status.usbip = usbip.state == UsbipCheck::State::kOk        ? "ok"
+                     : usbip.state == UsbipCheck::State::kMissing  ? "missing"
+                     : usbip.state == UsbipCheck::State::kNoDriver ? "nodriver"
+                                                                    : "old";
       status.usbip_version = usbip.version;
       if (const auto release = updates.available()) {
         status.update_version = release->version;
@@ -578,7 +672,7 @@ namespace {
         if (release->version != update_announced) {
           // Once per new version.
           update_announced = release->version;
-          write_first_line(desktop::data_dir() + "\\update-notified.txt", update_announced);
+          write_first_line(desktop::data_file("update-notified.txt"), update_announced);
           log::info("InputLine ", release->version, " is available: ", release->url);
           desktop::show_notification("InputLine " + release->version + " is available",
                                      "You have " INPUTLINE_VERSION ". Click to open the download page.", release->url);
@@ -619,13 +713,14 @@ int main(int argc, char **argv) {
   const bool service = args.command == "service";
   if (service) {
     // Options live next to the log, in a folder only administrators can change.
-    const std::string dir = desktop::data_dir();
-    if (desktop::prepare_data_dirs() && !parse_tokens(read_options_file(dir + "\\options.txt"), args)) {
-      std::fprintf(stderr, "ignoring options.txt: it has an invalid option\n");
+    if (desktop::prepare_data_dirs() && !parse_tokens(read_options_file(desktop::options_path()), args)) {
+      std::fprintf(stderr, "ignoring %s: it has an invalid option\n", desktop::options_path().c_str());
     }
-    if (args.log_file.empty() && !dir.empty()) {
-      args.log_file = dir + "\\inputline-host.log";
+#ifdef _WIN32
+    if (args.log_file.empty()) {
+      args.log_file = desktop::data_file("inputline-host.log");
     }
+#endif  // Linux: the log goes to the journal
   }
 
   log::set_level(args.verbose ? log::Level::kDebug : log::Level::kInfo);
@@ -636,7 +731,11 @@ int main(int argc, char **argv) {
     desktop::hide_console();
   }
   if (service) {
+#ifdef _WIN32
     log::info("InputLine ", INPUTLINE_VERSION, " starting as a Windows service");
+#else
+    log::info("InputLine ", INPUTLINE_VERSION, " starting as a service");
+#endif
     args.command = "service";
     return desktop::run_service([&args] { return run_command(args); }, [] { g_quit = true; });
   }

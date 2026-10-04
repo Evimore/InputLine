@@ -1,7 +1,8 @@
 name: Release
 
 # Publishes InputLine-Setup-vX.msi (Windows installer), a portable zip of
-# inputline-host, and the unsigned InputLine-vX-iOS.ipa.
+# inputline-host, inputline-vX-linux-x86_64.tar.gz, and the unsigned
+# InputLine-vX-iOS.ipa.
 #
 # Two ways to release:
 # - On GitHub: Actions → Release → Run workflow, and enter a version such as
@@ -81,6 +82,33 @@ jobs:
             InputLine-Setup-${{ env.TAG }}.msi
             inputline-${{ env.TAG }}-windows-x64.zip
 
+  linux:
+    name: Linux
+    needs: check
+    # The oldest supported Ubuntu, so the program runs on older and newer
+    # distributions alike; the C++ runtime is built in.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINPUTLINE_BUILD_TESTS=OFF "-DINPUTLINE_VERSION=${{ needs.check.outputs.version }}" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          cmake --build build -j
+          ./build/host/inputline-host --version
+      - name: Package
+        run: |
+          dir="inputline-$TAG-linux-x86_64"
+          mkdir "$dir"
+          cp build/host/inputline-host build/host/inputline-sim "$dir/"
+          strip "$dir/inputline-host" "$dir/inputline-sim"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md docs/host-setup-linux.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: inputline-${{ env.TAG }}-linux-x86_64.tar.gz
+
   inputline-ios:
     name: InputLine (iOS)
     needs: check
@@ -113,7 +141,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [check, windows, inputline-ios]
+    needs: [check, windows, linux, inputline-ios]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

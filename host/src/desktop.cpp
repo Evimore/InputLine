@@ -20,6 +20,13 @@
   #include <sddl.h>
   #include <shellapi.h>
   #include <wtsapi32.h>
+#else
+  #include <fstream>
+  #include <pwd.h>
+  #include <sys/types.h>
+  #include <unistd.h>
+  #include <utility>
+  #include <vector>
 #endif
 
 namespace inputline::desktop {
@@ -602,10 +609,204 @@ namespace inputline::desktop {
 
 #else
 
-  void show_pairing_code(const std::string &, const std::string &) {}
+  namespace {
+    namespace fs = std::filesystem;
 
-  bool show_notification(const std::string &, const std::string &, const std::string &) {
-    return false;
+    constexpr const char *kDataDir = "/var/lib/inputline";
+    constexpr const char *kConfigDir = "/etc/inputline";
+    constexpr const char *kInstalledBinary = "/usr/local/bin/inputline-host";
+    constexpr const char *kUnitPath = "/etc/systemd/system/inputline.service";
+    constexpr const char *kModulesLoadPath = "/etc/modules-load.d/inputline.conf";
+    constexpr const char *kUdevRulePath = "/etc/udev/rules.d/70-inputline.rules";
+    constexpr const char *kServiceUnit = "inputline";
+    /** Where InputLine apps reach this PC from: private networks, Tailscale, IPv6 local addresses. */
+    const char *const kAllowedSources[] = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"};
+    constexpr unsigned short kMdnsPort = 5353;
+
+    bool write_file(const std::string &path, const std::string &content, fs::perms perms) {
+      std::error_code error;
+      fs::create_directories(fs::path(path).parent_path(), error);
+      std::ofstream out(path, std::ios::trunc);
+      out << content;
+      out.close();
+      if (!out) {
+        std::fprintf(stderr, "  cannot write %s\n", path.c_str());
+        return false;
+      }
+      fs::permissions(path, perms, error);
+      return true;
+    }
+
+    /** Run a system tool by name; -1 if it isn't installed. */
+    int run_tool(std::vector<std::string> argv, std::string *output = nullptr) {
+      const std::string path = find_program(argv[0]);
+      if (path.empty()) {
+        return -1;
+      }
+      argv[0] = path;
+      return run_process(argv, output);
+    }
+
+    /** Signed-in users with a desktop session bus: (uid, user name). */
+    std::vector<std::pair<uid_t, std::string>> session_users() {
+      std::vector<std::pair<uid_t, std::string>> users;
+      std::error_code error;
+      for (const auto &entry : fs::directory_iterator("/run/user", error)) {
+        const std::string name = entry.path().filename().string();
+        char *end = nullptr;
+        const unsigned long uid = std::strtoul(name.c_str(), &end, 10);
+        if (end == name.c_str() || *end != '\0' || uid < 1000 || !fs::exists(entry.path() / "bus", error)) {
+          continue;
+        }
+        if (const passwd *user = ::getpwuid(static_cast<uid_t>(uid))) {
+          users.emplace_back(static_cast<uid_t>(uid), user->pw_name);
+        }
+      }
+      return users;
+    }
+
+    /**
+     * A desktop notification (freedesktop notify-send) on every signed-in
+     * user's screen. The service runs as root, so it asks for each user's
+     * session bus. Never blocks the caller.
+     */
+    void notify(const std::string &title, const std::string &body, bool urgent, int timeout_ms) {
+      std::thread([title, body, urgent, timeout_ms] {
+        const std::string notify_send = find_program("notify-send");
+        if (notify_send.empty()) {
+          static std::atomic<bool> warned {false};
+          if (!warned.exchange(true)) {
+            log::warn("notify-send isn't installed, so notifications (like pairing codes) only go to the log. Install it: ",
+                      install_hint(Package::kNotifications));
+          }
+          return;
+        }
+        const std::vector<std::string> notification {
+          notify_send, "--app-name=InputLine", "--icon=input-gaming", urgent ? "--urgency=critical" : "--urgency=normal",
+          "--expire-time=" + std::to_string(timeout_ms), title, body,
+        };
+        if (::geteuid() != 0) {
+          run_process(notification);
+          return;
+        }
+        const std::string runuser = find_program("runuser");
+        for (const auto &[uid, name] : session_users()) {
+          if (runuser.empty()) {
+            break;
+          }
+          std::vector<std::string> argv {runuser, "-u", name, "--", "env", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + std::to_string(uid) + "/bus"};
+          argv.insert(argv.end(), notification.begin(), notification.end());
+          std::string output;
+          if (run_process(argv, &output) != 0) {
+            log::debug("notification for ", name, " failed: ", output);
+          }
+        }
+      }).detach();
+    }
+
+    std::string os_release_id() {
+      std::ifstream in("/etc/os-release");
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.rfind("ID=", 0) == 0) {
+          std::string id = line.substr(3);
+          id.erase(std::remove(id.begin(), id.end(), '"'), id.end());
+          return id;
+        }
+      }
+      return {};
+    }
+
+    enum class Firewall {
+      kNone,
+      kUfw,
+      kFirewalld,
+    };
+
+    Firewall active_firewall() {
+      std::string output;
+      if (run_tool({"ufw", "status"}, &output) == 0 && output.find("Status: active") != std::string::npos) {
+        return Firewall::kUfw;
+      }
+      if (run_tool({"firewall-cmd", "--state"}) == 0) {
+        return Firewall::kFirewalld;
+      }
+      return Firewall::kNone;
+    }
+
+    /** Allow (or stop allowing) the link port, from the local network and Tailscale only. */
+    void change_firewall(unsigned short port, bool allow) {
+      const std::string link_port = std::to_string(port);
+      switch (active_firewall()) {
+        case Firewall::kUfw:
+          // ufw already lets mDNS (discovery) in by default.
+          for (const char *source : kAllowedSources) {
+            if (allow) {
+              run_tool({"ufw", "allow", "from", source, "to", "any", "port", link_port, "proto", "udp", "comment", "InputLine"});
+            } else {
+              run_tool({"ufw", "delete", "allow", "from", source, "to", "any", "port", link_port, "proto", "udp"});
+            }
+          }
+          std::printf("  %s ufw: UDP %s from the local network and Tailscale\n", allow ? "Allowed in" : "Removed from", link_port.c_str());
+          break;
+        case Firewall::kFirewalld:
+          for (const char *source : kAllowedSources) {
+            const std::string family = std::string(source).find(':') != std::string::npos ? "ipv6" : "ipv4";
+            for (const unsigned short each : {port, kMdnsPort}) {
+              const std::string rule = "rule family=\"" + family + "\" source address=\"" + source + "\" port port=\"" + std::to_string(each) +
+                                       "\" protocol=\"udp\" accept";
+              run_tool({"firewall-cmd", "--permanent", (allow ? "--add-rich-rule=" : "--remove-rich-rule=") + rule});
+            }
+          }
+          run_tool({"firewall-cmd", "--reload"});
+          std::printf("  %s firewalld: UDP %s and mDNS from the local network and Tailscale\n", allow ? "Allowed in" : "Removed from",
+                      link_port.c_str());
+          break;
+        case Firewall::kNone:
+          if (allow) {
+            std::printf("  No active ufw or firewalld found. If another firewall runs, allow UDP %s from the local network.\n", link_port.c_str());
+          }
+          break;
+      }
+    }
+
+    void check_line(bool ok, const std::string &what, const std::string &fix) {
+      std::printf("  [%s] %s%s%s\n", ok ? "ok" : "!!", what.c_str(), ok ? "" : ": ", ok ? "" : fix.c_str());
+    }
+  }  // namespace
+
+  std::string install_hint(Package package) {
+    const bool pacman = !find_program("pacman").empty();
+    const bool apt = !find_program("apt-get").empty();
+    const bool dnf = !find_program("dnf").empty();
+    switch (package) {
+      case Package::kUsbip:
+        return pacman ? "sudo pacman -S --needed usbip"
+               : apt  ? (os_release_id() == "ubuntu" ? "sudo apt install linux-tools-generic" : "sudo apt install usbip")
+               : dnf  ? "sudo dnf install usbip"
+                      : "install the usbip tool with your package manager";
+      case Package::kAvahi:
+        return pacman ? "sudo pacman -S --needed avahi && sudo systemctl enable --now avahi-daemon"
+               : apt  ? "sudo apt install avahi-daemon avahi-utils"
+               : dnf  ? "sudo dnf install avahi avahi-tools && sudo systemctl enable --now avahi-daemon"
+                      : "install Avahi (avahi-daemon and avahi-publish) with your package manager";
+      case Package::kNotifications:
+        return pacman ? "sudo pacman -S --needed libnotify"
+               : apt  ? "sudo apt install libnotify-bin"
+               : dnf  ? "sudo dnf install libnotify"
+                      : "install notify-send (libnotify) with your package manager";
+    }
+    return {};
+  }
+
+  void show_pairing_code(const std::string &client_name, const std::string &code) {
+    const std::string spaced = code.size() == 6 ? code.substr(0, 3) + " " + code.substr(3) : code;
+    notify("InputLine pairing code: " + spaced, "Type it into InputLine on " + client_name + ". It works for 2 minutes.", true, 120000);
+  }
+
+  bool show_notification(const std::string &title, const std::string &text, const std::string &url) {
+    notify(title, url.empty() ? text : text + "\n" + url, false, 20000);
+    return true;
   }
 
   int run_notifier() {
@@ -615,36 +816,189 @@ namespace inputline::desktop {
   void hide_console() {}
 
   bool is_elevated() {
-    return false;
+    return ::geteuid() == 0;
   }
 
   std::string data_dir() {
-    return {};
+    return kDataDir;
   }
 
   bool prepare_data_dirs() {
-    return false;
+    if (::geteuid() != 0) {
+      return false;
+    }
+    // Readable by users (status, for 'inputline-host status'); the pairing
+    // keys in 'pairing' by root only.
+    std::error_code error;
+    fs::create_directories(fs::path(kDataDir) / "pairing", error);
+    fs::permissions(kDataDir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec,
+                    error);
+    fs::permissions(fs::path(kDataDir) / "pairing", fs::perms::owner_all, error);
+    return !error;
   }
 
   bool service_installed() {
-    return false;
+    std::error_code error;
+    return fs::exists(kUnitPath, error);
   }
 
-  int run_service(const std::function<int()> &, const std::function<void()> &) {
-    std::fprintf(stderr, "'service' is for Windows. On Linux, run 'inputline-host run' from a systemd unit.\n");
-    return 1;
+  int run_service(const std::function<int()> &serve, const std::function<void()> &) {
+    return serve();  // systemd stops it with SIGTERM
   }
 
-  int install(const InstallOptions &) {
-    std::fprintf(stderr, "'install' is for Windows. On Linux, run 'inputline-host run' as root from a systemd unit.\n");
-    return 1;
+  int install(const InstallOptions &options) {
+    if (::geteuid() != 0) {
+      std::fprintf(stderr, "Run it as root: sudo inputline-host install\n");
+      return 1;
+    }
+    std::printf("Installing InputLine as a background service\n");
+    std::error_code error;
+
+    // The program, where the service runs it from. Renamed into place, so
+    // this also updates a copy that is running.
+    const fs::path self = fs::read_symlink("/proc/self/exe", error);
+    if (!error && self != fs::path(kInstalledBinary)) {
+      const std::string temporary = std::string(kInstalledBinary) + ".new";
+      fs::create_directories(fs::path(kInstalledBinary).parent_path(), error);
+      if (fs::copy_file(self, temporary, fs::copy_options::overwrite_existing, error)) {
+        fs::rename(temporary, kInstalledBinary, error);
+      }
+      if (error) {
+        std::fprintf(stderr, "  cannot copy the program to %s: %s\n", kInstalledBinary, error.message().c_str());
+        return 1;
+      }
+      fs::permissions(kInstalledBinary, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec,
+                      error);
+    }
+    std::printf("  Program: %s\n", kInstalledBinary);
+
+    // Settings and data.
+    const std::string options_file = options_path();
+    if (!fs::exists(options_file, error)) {
+      std::string content =
+        "# Options for the InputLine service, written as on the command line\n"
+        "# (see 'inputline-host --help'). After a change: sudo systemctl restart inputline\n"
+        "#\n"
+        "# Log report timing every 10 s:\n"
+        "# --stats\n";
+      if (!options.run_arguments.empty()) {
+        std::string line;
+        for (const auto &argument : options.run_arguments) {
+          line += (line.empty() ? "" : " ") + argument;
+        }
+        content += "\n" + line + "\n";
+      }
+      write_file(options_file, content, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
+    }
+    std::printf("  Options: %s\n", options_file.c_str());
+    prepare_data_dirs();
+
+    // The USB/IP virtual host controller the controller plugs into, now and at every boot.
+    write_file(kModulesLoadPath, "# InputLine: the USB/IP virtual host controller its virtual Steam Controller plugs into\nvhci-hcd\n",
+               fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
+    run_tool({"modprobe", "vhci-hcd"});
+
+    // Let the signed-in user's Steam open the virtual controller.
+    write_file(kUdevRulePath,
+               "# InputLine's virtual Steam Controller: Steam, running as the signed-in user, opens it\n"
+               "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"28de\", ATTRS{idProduct}==\"1302\", MODE=\"0660\", TAG+=\"uaccess\"\n"
+               "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"28de\", ATTRS{idProduct}==\"1302\", MODE=\"0660\", TAG+=\"uaccess\"\n",
+               fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
+    run_tool({"udevadm", "control", "--reload-rules"});
+
+    change_firewall(options.port, true);
+    {
+      std::ofstream port_file((fs::path(kDataDir) / "firewall-port").string(), std::ios::trunc);
+      port_file << options.port << "\n";
+    }
+
+    // The service: starts with the system, restarts if it stops.
+    const std::string modprobe = find_program("modprobe");
+    std::string unit =
+      "[Unit]\n"
+      "Description=InputLine: Steam Controller from an iPad or iPhone, with full Steam Input\n"
+      "Documentation=" + std::string(update::kRepositoryUrl) + "\n"
+      "Wants=network-online.target\n"
+      "After=network-online.target avahi-daemon.service\n"
+      "\n"
+      "[Service]\n"
+      "Type=simple\n";
+    if (!modprobe.empty()) {
+      unit += "ExecStartPre=-" + modprobe + " vhci-hcd\n";
+    }
+    unit +=
+      "ExecStart=" + std::string(kInstalledBinary) + " service\n"
+      "Restart=on-failure\n"
+      "RestartSec=3\n"
+      "\n"
+      "[Install]\n"
+      "WantedBy=multi-user.target\n";
+    if (!write_file(kUnitPath, unit, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read)) {
+      return 1;
+    }
+    run_tool({"systemctl", "daemon-reload"});
+    run_tool({"systemctl", "enable", kServiceUnit});
+    const int started = run_tool({"systemctl", "restart", kServiceUnit});
+    std::printf("  Service: %s, starts with the system\n", started == 0 ? "running" : "installed, but it did not start (journalctl -u inputline)");
+
+    // What else it needs.
+    std::printf("\nChecks:\n");
+    const UsbipCheck usbip = check_usbip({});
+    check_line(usbip.state != UsbipCheck::State::kMissing, "usbip (plugs the virtual controller in)", install_hint(Package::kUsbip));
+    check_line(usbip.state != UsbipCheck::State::kNoDriver, "vhci-hcd kernel module",
+               "your kernel doesn't have it; InputLine can't plug controllers in without it");
+    const bool avahi = !find_program("avahi-publish").empty() && run_tool({"systemctl", "is-active", "--quiet", "avahi-daemon"}) == 0;
+    check_line(avahi, "Avahi (InputLine finds this PC on the network)", install_hint(Package::kAvahi) + ", or type this PC's address in InputLine");
+    check_line(!find_program("notify-send").empty(), "notify-send (shows the pairing code)",
+               install_hint(Package::kNotifications) + "; the code is also in: journalctl -u inputline");
+    std::printf("\nDone. Open InputLine on your iPad or iPhone and tap this PC; the pairing code pops up here.\n"
+                "Status: inputline-host status    Log: journalctl -u inputline -f\n");
+    return 0;
   }
 
   int uninstall() {
-    std::fprintf(stderr, "'uninstall' is for Windows.\n");
-    return 1;
+    if (::geteuid() != 0) {
+      std::fprintf(stderr, "Run it as root: sudo inputline-host uninstall\n");
+      return 1;
+    }
+    std::error_code error;
+    run_tool({"systemctl", "disable", "--now", kServiceUnit});
+    fs::remove(kUnitPath, error);
+    run_tool({"systemctl", "daemon-reload"});
+    std::printf("Removed the InputLine service\n");
+
+    unsigned short port = 48150;
+    {
+      std::ifstream port_file((fs::path(kDataDir) / "firewall-port").string());
+      unsigned int value = 0;
+      if (port_file >> value && value > 0 && value <= 65535) {
+        port = static_cast<unsigned short>(value);
+      }
+    }
+    change_firewall(port, false);
+    fs::remove(fs::path(kDataDir) / "firewall-port", error);
+    fs::remove(kModulesLoadPath, error);
+    fs::remove(kUdevRulePath, error);
+    run_tool({"udevadm", "control", "--reload-rules"});
+    fs::remove(kInstalledBinary, error);
+    std::printf("Removed %s\n", kInstalledBinary);
+    std::printf("Kept your paired devices in %s and your options in %s; delete them to remove those too.\n", kDataDir, kConfigDir);
+    return 0;
   }
 
 #endif
+
+  std::string data_file(const std::string &name) {
+    const std::string dir = data_dir();
+    return dir.empty() ? std::string() : (std::filesystem::path(dir) / name).string();
+  }
+
+  std::string options_path() {
+#ifdef _WIN32
+    return data_file("options.txt");
+#else
+    return "/etc/inputline/options.txt";
+#endif
+  }
 
 }  // namespace inputline::desktop

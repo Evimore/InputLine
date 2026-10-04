@@ -1,10 +1,8 @@
 /**
  * @file desktop.h
  * @brief The parts of inputline-host that touch the user's desktop: the pairing
- *        code popup, running in the background (as a Windows service or a
- *        logon task), and where it keeps its files.
- *
- * Everything here is Windows-specific; other platforms get harmless stubs.
+ *        code popup, running in the background (a Windows service, or a
+ *        systemd service on Linux), and where it keeps its files.
  */
 #pragma once
 
@@ -50,9 +48,16 @@ namespace inputline::desktop {
   /**
    * @brief Where the background copy keeps its files: C:\ProgramData\InputLine
    *        on Windows (the log, options.txt, and pairings in its 'pairing'
-   *        folder). Empty on other platforms.
+   *        folder), /var/lib/inputline on Linux (status, and pairings in
+   *        'pairing'; the log goes to the journal).
    */
   std::string data_dir();
+
+  /** A file in data_dir(), or empty if there is none. */
+  std::string data_file(const std::string &name);
+
+  /** The service's options file: data_dir()\options.txt on Windows, /etc/inputline/options.txt on Linux. */
+  std::string options_path();
 
   /**
    * @brief Create data_dir() with safe permissions: only administrators and
@@ -79,15 +84,31 @@ namespace inputline::desktop {
   };
 
   /**
-   * @brief Without the installer: copy this executable to Program Files,
-   *        allow the link port through the firewall for the local network and
-   *        Tailscale, and start it at every logon with administrator rights.
+   * @brief Windows, without the installer: copy this executable to Program
+   *        Files, allow the link port through the firewall for the local
+   *        network and Tailscale, and start it at every logon with
+   *        administrator rights.
+   *
+   * Linux (as root): copy it to /usr/local/bin, set it up as the 'inputline'
+   * systemd service, load vhci-hcd now and at boot, add a udev rule so Steam
+   * can open the virtual controller, and allow the port in ufw or firewalld.
    * @return Process exit code.
    */
   int install(const InstallOptions &options);
 
   /** Undo install(). Paired devices are kept. */
   int uninstall();
+
+#ifndef _WIN32
+  enum class Package {
+    kUsbip,
+    kAvahi,
+    kNotifications,
+  };
+
+  /** How to install @p package on this distribution (pacman, apt or dnf). */
+  std::string install_hint(Package package);
+#endif
 
 #ifdef _WIN32
   /** UTF-8 to UTF-16 and back. */
