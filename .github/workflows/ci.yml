@@ -304,7 +304,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" "linux-tools-$(uname -r)" linux-tools-common \
-            avahi-daemon avahi-utils libnotify-bin ufw usbutils
+            avahi-daemon avahi-utils libnotify-bin ufw usbutils libglib2.0-bin dbus
           sudo systemctl start avahi-daemon
           sudo ufw --force enable
       - name: Build
@@ -355,11 +355,32 @@ jobs:
       - name: Stream and attach
         run: |
           ./build/host/inputline-sim --state "$RUNNER_TEMP/sim.pairing" run 40 > "$RUNNER_TEMP/sim.log" 2>&1 &
-          for i in $(seq 1 20); do inputline-host status | grep -q "1 controller" && break; sleep 1; done
+          for i in $(seq 1 20); do inputline-host status | grep -q "(1 controller)" && break; sleep 1; done
           inputline-host status
-          inputline-host status | grep -q "Connected: inputline-sim, 1 controller"
+          inputline-host status | grep -q "Connected: inputline-sim (1 controller)"
           for i in $(seq 1 10); do lsusb -d 28de:1302 && break; sleep 1; done
           lsusb -d 28de:1302
+      - name: Tray icon (StatusNotifierItem over D-Bus)
+        run: |
+          test -f /etc/xdg/autostart/inputline-tray.desktop
+          test -f /usr/local/share/applications/inputline.desktop
+          file /usr/local/share/icons/hicolor/64x64/apps/inputline.png | grep -q "PNG image data, 64 x 64"
+          cat > "$RUNNER_TEMP/tray.sh" <<'SCRIPT'
+          set -e
+          HOME="$RUNNER_TEMP/home" inputline-host tray &
+          sleep 2
+          call() { gdbus call --session --dest io.github.evimore.InputLine.Tray "$@"; }
+          call --object-path /StatusNotifierItem --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierItem ToolTip | tee "$RUNNER_TEMP/tooltip.txt"
+          grep -q "Connected: inputline-sim (1 controller)" "$RUNNER_TEMP/tooltip.txt"
+          call --object-path /StatusNotifierItem --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierItem IconPixmap | grep -q "(64, 64,"
+          call --object-path /MenuBar --method com.canonical.dbusmenu.GetLayout 0 "int32 -1" "[]" | tee "$RUNNER_TEMP/menu.txt"
+          grep -q "Show the log" "$RUNNER_TEMP/menu.txt"
+          # A second icon in the same session steps aside.
+          HOME="$RUNNER_TEMP/home" inputline-host tray
+          kill %1
+          SCRIPT
+          mkdir -p "$RUNNER_TEMP/home"
+          RUNNER_TEMP="$RUNNER_TEMP" dbus-run-session -- bash "$RUNNER_TEMP/tray.sh"
       - name: Uninstall
         run: |
           sudo inputline-host uninstall
@@ -367,6 +388,8 @@ jobs:
           test ! -e /etc/systemd/system/inputline.service
           test ! -e /usr/local/bin/inputline-host
           test ! -e /etc/udev/rules.d/70-inputline.rules
+          test ! -e /etc/xdg/autostart/inputline-tray.desktop
+          test ! -e /usr/local/share/applications/inputline.desktop
           ! sudo ufw status | grep -q "48150/udp"
           sudo test -f /var/lib/inputline/pairing/inputline-host.conf
       - name: Logs

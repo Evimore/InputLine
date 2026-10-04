@@ -11,6 +11,7 @@ add_library(inputline_host STATIC
   src/status_file.cpp
   src/steam_controller_device.cpp
   src/tray.cpp
+  src/tray_badge.cpp
   src/update_check.cpp
   src/usbip_attach.cpp
   src/usbip_server.cpp
@@ -21,6 +22,10 @@ target_compile_options(inputline_host PRIVATE ${INPUTLINE_WARNINGS})
 if(WIN32)
   target_link_libraries(inputline_host PUBLIC ws2_32 user32 advapi32 wtsapi32 shell32 winhttp userenv version)
   target_compile_definitions(inputline_host PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The tray icon: libdbus-1 is loaded at run time, so only dlopen is linked.
+  target_sources(inputline_host PRIVATE src/tray_linux.cpp src/dbus_lite.cpp)
+  target_link_libraries(inputline_host PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 add_executable(inputline-host src/main.cpp)

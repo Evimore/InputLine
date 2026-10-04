@@ -3,12 +3,15 @@
 
 #include "check.h"
 #include "status_file.h"
+#include "tray_badge.h"
 #include "update_check.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <vector>
 
 using namespace inputline;
 
@@ -94,7 +97,38 @@ namespace {
 
 }  // namespace
 
+namespace {
+
+  void test_badges() {
+    using inputline::tray::Badge;
+    using inputline::tray::draw_badge;
+    for (const int size : {16, 24, 32, 64}) {
+      for (const Badge badge : {Badge::kProblem, Badge::kApp, Badge::kController}) {
+        std::vector<std::uint32_t> pixels(static_cast<std::size_t>(size * size), 0);
+        draw_badge(pixels.data(), size, badge);
+        // The badge is opaque in the top left; the opposite corner is untouched.
+        const int radius = static_cast<int>(size * (size < 20 ? 0.23 : 0.19));
+        const std::uint32_t edge = pixels[static_cast<std::size_t>(radius / 4 + 1) * size + radius + 1];
+        CHECK((edge >> 24) == 0xFF);
+        CHECK(pixels.back() == 0);
+        // Its colour: red for a problem, green otherwise (white app badge with a green symbol).
+        bool red = false;
+        bool green = false;
+        for (const auto pixel : pixels) {
+          const int r = (pixel >> 16) & 0xFF, g = (pixel >> 8) & 0xFF, b = pixel & 0xFF;
+          red = red || (r > 200 && g < 100 && b < 100);
+          green = green || (g > 130 && r < 100 && b < 100);
+        }
+        CHECK(red == (badge == Badge::kProblem));
+        CHECK(green == (badge != Badge::kProblem));
+      }
+    }
+  }
+
+}  // namespace
+
 int main() {
+  test_badges();
   test_parse_releases();
   test_newer_release();
   test_status_file();

@@ -40,6 +40,7 @@ sudo ./inputline-host install
 - loads `vhci-hcd` now and at every boot,
 - adds a udev rule so Steam, running as you, can open the virtual controller,
 - allows UDP port 48150 in **ufw** or **firewalld**, from your local network and Tailscale only (CachyOS uses ufw),
+- shows the **InputLine icon** in your desktop's tray, now and at every sign-in (see below),
 - ends with a short checklist of anything still missing.
 
 You can delete the downloaded folder afterwards.
@@ -53,6 +54,19 @@ Missed the notification, or playing in Steam's Gaming Mode, where desktop notifi
 ```sh
 journalctl -u inputline | grep "pairing code"
 ```
+
+## The tray icon
+
+On KDE Plasma (and other desktops that show tray icons, such as GNOME with the AppIndicator extension), the InputLine icon sits in the system tray:
+
+| Badge | Meaning |
+|---|---|
+| None | The service runs, and no InputLine app is connected |
+| White, with a green ▶ | An InputLine app is connected |
+| Green, with a white ▶ | A controller is plugged in |
+| Red ✕ | Something needs you (usbip or vhci-hcd missing); the menu says how to fix it |
+
+Click it for the menu: the status, an update when one is out, **Show the log**, the setup guide, and **Hide this icon**. To show a hidden icon again, open **InputLine** from the application menu.
 
 ## Checking that it works
 

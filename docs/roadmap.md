@@ -26,7 +26,7 @@
 - [x] Fuzzing in CI: link protocol, link server and USB/IP server
 - [x] usbip-win2 installed in either order: the installer's last screen shows its status (green, amber, red) with a download link; the tray icon shows a red mark and the link until it's there
 - [x] Windows installer (MSI): `inputline-host` runs as a service that starts with Windows, with the firewall rule; CI installs and uninstalls it
-- [x] Linux: `sudo inputline-host install` sets it up as a systemd service (vhci-hcd, udev rule for Steam, ufw/firewalld rule), with Avahi discovery, desktop notifications for the pairing code, and `inputline-host status`; CI installs it, pairs through it and uninstalls it
+- [x] Linux: `sudo inputline-host install` sets it up as a systemd service (vhci-hcd, udev rule for Steam, ufw/firewalld rule), with Avahi discovery, desktop notifications for the pairing code, a tray icon (KDE Plasma and other StatusNotifierItem trays) and `inputline-host status`; CI installs it, pairs through it, checks the icon and uninstalls it
 
 ## Phases
 

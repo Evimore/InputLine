@@ -21,6 +21,9 @@
   #include <shellapi.h>
   #include <wtsapi32.h>
 #else
+  #include "tray_icon_pixels.h"
+
+  #include <cstdint>
   #include <fstream>
   #include <pwd.h>
   #include <sys/types.h>
@@ -618,6 +621,9 @@ namespace inputline::desktop {
     constexpr const char *kUnitPath = "/etc/systemd/system/inputline.service";
     constexpr const char *kModulesLoadPath = "/etc/modules-load.d/inputline.conf";
     constexpr const char *kUdevRulePath = "/etc/udev/rules.d/70-inputline.rules";
+    constexpr const char *kAutostartPath = "/etc/xdg/autostart/inputline-tray.desktop";
+    constexpr const char *kMenuEntryPath = "/usr/local/share/applications/inputline.desktop";
+    constexpr const char *kIconDir = "/usr/local/share/icons/hicolor";
     constexpr const char *kServiceUnit = "inputline";
     /** Where InputLine apps reach this PC from: private networks, Tailscale, IPv6 local addresses. */
     const char *const kAllowedSources[] = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"};
@@ -682,7 +688,8 @@ namespace inputline::desktop {
           return;
         }
         const std::vector<std::string> notification {
-          notify_send, "--app-name=InputLine", "--icon=input-gaming", urgent ? "--urgency=critical" : "--urgency=normal",
+          notify_send, "--app-name=InputLine", fs::exists("/usr/local/share/icons/hicolor/64x64/apps/inputline.png") ? "--icon=inputline" : "--icon=input-gaming",
+          urgent ? "--urgency=critical" : "--urgency=normal",
           "--expire-time=" + std::to_string(timeout_ms), title, body,
         };
         if (::geteuid() != 0) {
@@ -767,6 +774,96 @@ namespace inputline::desktop {
             std::printf("  No active ufw or firewalld found. If another firewall runs, allow UDP %s from the local network.\n", link_port.c_str());
           }
           break;
+      }
+    }
+
+    // --- A PNG writer, just enough for the icon (stored, uncompressed) --------
+
+    std::uint32_t crc32(const std::uint8_t *data, std::size_t length, std::uint32_t crc = 0) {
+      crc = ~crc;
+      for (std::size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+          crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+      }
+      return ~crc;
+    }
+
+    void put32(std::string &out, std::uint32_t value) {
+      for (int shift = 24; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xFF));
+      }
+    }
+
+    void png_chunk(std::string &out, const char *type, const std::string &data) {
+      put32(out, static_cast<std::uint32_t>(data.size()));
+      const std::string body = std::string(type, 4) + data;
+      out += body;
+      put32(out, crc32(reinterpret_cast<const std::uint8_t *>(body.data()), body.size()));
+    }
+
+    /** An RGBA PNG of @p pixels (0xAARRGGBB). */
+    std::string encode_png(const std::uint32_t *pixels, int size) {
+      std::string raw;
+      for (int y = 0; y < size; ++y) {
+        raw.push_back(0);  // no filter
+        for (int x = 0; x < size; ++x) {
+          const std::uint32_t pixel = pixels[y * size + x];
+          raw.push_back(static_cast<char>((pixel >> 16) & 0xFF));
+          raw.push_back(static_cast<char>((pixel >> 8) & 0xFF));
+          raw.push_back(static_cast<char>(pixel & 0xFF));
+          raw.push_back(static_cast<char>(pixel >> 24));
+        }
+      }
+      // zlib stream of stored deflate blocks.
+      std::string zlib = "\x78\x01";
+      for (std::size_t offset = 0; offset < raw.size() || offset == 0;) {
+        const std::size_t length = std::min<std::size_t>(65535, raw.size() - offset);
+        const bool last = offset + length >= raw.size();
+        zlib.push_back(last ? 1 : 0);
+        zlib.push_back(static_cast<char>(length & 0xFF));
+        zlib.push_back(static_cast<char>(length >> 8));
+        zlib.push_back(static_cast<char>(~length & 0xFF));
+        zlib.push_back(static_cast<char>((~length >> 8) & 0xFF));
+        zlib.append(raw, offset, length);
+        offset += length;
+        if (last) {
+          break;
+        }
+      }
+      std::uint32_t a = 1, b = 0;
+      for (const char c : raw) {
+        a = (a + static_cast<std::uint8_t>(c)) % 65521;
+        b = (b + a) % 65521;
+      }
+      put32(zlib, (b << 16) | a);
+
+      std::string header;
+      put32(header, static_cast<std::uint32_t>(size));
+      put32(header, static_cast<std::uint32_t>(size));
+      header += std::string("\x08\x06\x00\x00\x00", 5);  // 8-bit RGBA
+      std::string png = "\x89PNG\r\n\x1a\n";
+      png_chunk(png, "IHDR", header);
+      png_chunk(png, "IDAT", zlib);
+      png_chunk(png, "IEND", "");
+      return png;
+    }
+
+    void install_icons() {
+      for (const auto &image : tray::kIconImages) {
+        const std::string dir = std::string(kIconDir) + "/" + std::to_string(image.size) + "x" + std::to_string(image.size) + "/apps";
+        std::error_code error;
+        fs::create_directories(dir, error);
+        std::ofstream(dir + "/inputline.png", std::ios::binary | std::ios::trunc) << encode_png(image.pixels, image.size);
+      }
+      run_tool({"gtk-update-icon-cache", "--quiet", "--ignore-theme-index", kIconDir});
+    }
+
+    void remove_icons() {
+      for (const auto &image : tray::kIconImages) {
+        std::error_code error;
+        fs::remove(std::string(kIconDir) + "/" + std::to_string(image.size) + "x" + std::to_string(image.size) + "/apps/inputline.png", error);
       }
     }
 
@@ -906,6 +1003,21 @@ namespace inputline::desktop {
                fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
     run_tool({"udevadm", "control", "--reload-rules"});
 
+    // The tray icon: at every sign-in, and in the application menu (to show it
+    // again after "Hide this icon"). The service starts it right away.
+    install_icons();
+    const std::string desktop_entry =
+      "[Desktop Entry]\n"
+      "Type=Application\n"
+      "Name=InputLine\n"
+      "Comment=Steam Controller from your iPad or iPhone, with full Steam Input\n"
+      "Icon=inputline\n";
+    write_file(kAutostartPath, desktop_entry + "Exec=" + std::string(kInstalledBinary) + " tray\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n",
+               fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
+    write_file(kMenuEntryPath, desktop_entry + "Exec=" + std::string(kInstalledBinary) + " tray --show\nCategories=Game;Utility;\n",
+               fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
+    std::printf("  Tray icon: at every sign-in (InputLine in the application menu shows it again if hidden)\n");
+
     change_firewall(options.port, true);
     {
       std::ofstream port_file((fs::path(kDataDir) / "firewall-port").string(), std::ios::trunc);
@@ -980,6 +1092,11 @@ namespace inputline::desktop {
     fs::remove(kModulesLoadPath, error);
     fs::remove(kUdevRulePath, error);
     run_tool({"udevadm", "control", "--reload-rules"});
+    // The tray icons, and their entries.
+    run_tool({"pkill", "-f", std::string(kInstalledBinary) + " tray"});
+    fs::remove(kAutostartPath, error);
+    fs::remove(kMenuEntryPath, error);
+    remove_icons();
     fs::remove(kInstalledBinary, error);
     std::printf("Removed %s\n", kInstalledBinary);
     std::printf("Kept your paired devices in %s and your options in %s; delete them to remove those too.\n", kDataDir, kConfigDir);

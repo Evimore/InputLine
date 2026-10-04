@@ -1,6 +1,7 @@
 /**
  * @file tray.h
- * @brief The InputLine icon in the taskbar's notification area (Windows).
+ * @brief The InputLine icon in the taskbar's notification area (Windows), or
+ *        in the desktop's tray on Linux (StatusNotifierItem; tray_linux.cpp).
  *
  * The service runs in the background without a desktop, so it starts a small
  * helper, 'inputline-host tray', as the signed-in user. The helper shows the
@@ -8,7 +9,8 @@
  * notifications, and a menu. When the service stops it signals the helpers
  * to quit and waits for them, so an upgrade can replace inputline-host.exe.
  *
- * Other platforms get harmless stubs.
+ * On Linux the service starts the icon for users signed in at the time, and an
+ * XDG autostart entry at later sign-ins. Other platforms get harmless stubs.
  */
 #pragma once
 

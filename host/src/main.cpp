@@ -420,7 +420,10 @@ namespace {
       for (const auto &device : status->devices) {
         devices += (devices.empty() ? "" : ", ") + device;
       }
-      std::printf("  Connected: %s, %zu controller(s) plugged in\n", devices.c_str(), status->controllers);
+      const std::string controllers = status->controllers == 0   ? "no controller on yet"
+                                      : status->controllers == 1 ? "1 controller"
+                                                                 : std::to_string(status->controllers) + " controllers";
+      std::printf("  Connected: %s (%s)\n", devices.c_str(), controllers.c_str());
     }
 #ifdef _WIN32
     const char *driver = "usbip-win2";
