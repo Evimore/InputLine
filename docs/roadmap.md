@@ -16,7 +16,7 @@
 - [x] Recover single lost datagrams: each one also carries the previous report
 - [x] Unsigned `InputLine-iOS.ipa` on every CI run and release, for sideloading without a Mac
 - [x] Automatic discovery: `inputline-host` announces the PC over DNS-SD (`_inputline._udp`); InputLine lists it and follows a paired PC to a new address
-- [x] InputLine remembers every address a PC answered on (home network, VPN) and tries them in turn
+- [x] InputLine remembers every address a PC answered on (home network, VPN) and tries them all at once
 - [x] Releases from GitHub's website: Actions → Release → Run workflow
 - [x] Protocol version 2: X25519 pairing, ChaCha20-Poly1305 encryption, version negotiation with frozen wire-format tests
 - [x] Disconnect / Connect in the app: hand the controller back to the iPad; it goes back to the PC when switched off and on

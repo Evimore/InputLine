@@ -51,7 +51,7 @@ From then on, just switch the controller on: it reconnects by itself, even while
 
 Use the same address your streaming app uses. If the PC's local address changes later, InputLine finds it again by itself.
 
-InputLine remembers every address where it has reached your PC. When the current one doesn't answer, it tries the others in turn, so once both your home address and your VPN address have worked, switching between home and away needs no typing.
+InputLine remembers every address where it has reached your PC and tries them all at once, so once both your home address and your VPN address have worked, switching between home and away needs no typing. When both answer, it uses the home one. It also notices when the iPad or iPhone changes networks (Wi-Fi to cellular, VPN on or off) and finds the PC again straight away.
 
 If InputLine doesn't find the PC at home:
 
