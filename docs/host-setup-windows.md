@@ -71,6 +71,8 @@ Put extra options in `C:\ProgramData\InputLine\options.txt` (edit it as administ
 
 `inputline-host --help` lists everything.
 
+For tighter security, `--no-remote-pairing` stops devices from asking for a pairing code from the couch. To pair a new device later, stop the service (`Stop-Service InputLine`), run `inputline-host pair` from **Terminal (Admin)**, type the code it shows into InputLine, then press Ctrl+C and `Start-Service InputLine`. The firewall already lets only your local network and Tailscale through.
+
 Paired devices, from **Terminal (Admin)**:
 
 ```powershell

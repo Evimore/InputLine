@@ -447,6 +447,23 @@ namespace inputline::desktop {
     return service != nullptr;
   }
 
+  bool service_active() {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (manager == nullptr) {
+      return false;
+    }
+    const std::wstring name = widen(kServiceName);
+    SC_HANDLE service = OpenServiceW(manager, name.c_str(), SERVICE_QUERY_STATUS);
+    bool active = false;
+    if (service != nullptr) {
+      SERVICE_STATUS status {};
+      active = QueryServiceStatus(service, &status) && (status.dwCurrentState == SERVICE_RUNNING || status.dwCurrentState == SERVICE_START_PENDING);
+      CloseServiceHandle(service);
+    }
+    CloseServiceHandle(manager);
+    return active;
+  }
+
   namespace {
     std::function<int()> g_serve;
     std::function<void()> g_stop;
@@ -627,6 +644,11 @@ namespace inputline::desktop {
     constexpr const char *kServiceUnit = "inputline";
     /** Where InputLine apps reach this PC from: private networks, Tailscale, IPv6 local addresses. */
     const char *const kAllowedSources[] = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"};
+    /** With 'install --tailscale-only': Tailscale's addresses only. */
+    const char *const kTailscaleSources[] = {"100.64.0.0/10", "fd7a:115c:a1e0::/48"};
+    /** The firewall's port and scope ("local" or "tailscale"), as install last set them up. */
+    constexpr const char *kFirewallPortFile = "firewall-port";
+    constexpr const char *kFirewallScopeFile = "firewall-scope";
     constexpr unsigned short kMdnsPort = 5353;
 
     bool write_file(const std::string &path, const std::string &content, fs::perms perms) {
@@ -741,40 +763,78 @@ namespace inputline::desktop {
       return Firewall::kNone;
     }
 
-    /** Allow (or stop allowing) the link port, from the local network and Tailscale only. */
-    void change_firewall(unsigned short port, bool allow) {
+    /**
+     * Allow the link port from the local network and Tailscale, or from
+     * Tailscale only; or (allow = false) remove what any install allowed.
+     */
+    void change_firewall(unsigned short port, bool allow, bool tailscale_only, bool quiet = false) {
       const std::string link_port = std::to_string(port);
+      std::vector<std::string> sources;
+      if (allow) {
+        if (tailscale_only) {
+          sources.assign(std::begin(kTailscaleSources), std::end(kTailscaleSources));
+        } else {
+          sources.assign(std::begin(kAllowedSources), std::end(kAllowedSources));
+        }
+      } else {
+        sources.assign(std::begin(kAllowedSources), std::end(kAllowedSources));
+        sources.insert(sources.end(), std::begin(kTailscaleSources), std::end(kTailscaleSources));
+      }
+      const char *from = tailscale_only ? "Tailscale only" : "the local network and Tailscale";
       switch (active_firewall()) {
         case Firewall::kUfw:
           // ufw already lets mDNS (discovery) in by default.
-          for (const char *source : kAllowedSources) {
+          for (const auto &source : sources) {
             if (allow) {
               run_tool({"ufw", "allow", "from", source, "to", "any", "port", link_port, "proto", "udp", "comment", "InputLine"});
             } else {
-              run_tool({"ufw", "delete", "allow", "from", source, "to", "any", "port", link_port, "proto", "udp"});
+              std::string ignored;  // "Could not delete non-existent rule" for the other scope's
+              run_tool({"ufw", "delete", "allow", "from", source, "to", "any", "port", link_port, "proto", "udp"}, &ignored);
             }
           }
-          std::printf("  %s ufw: UDP %s from the local network and Tailscale\n", allow ? "Allowed in" : "Removed from", link_port.c_str());
+          if (!quiet && allow) {
+            std::printf("  Allowed in ufw: UDP %s from %s\n", link_port.c_str(), from);
+          } else if (!quiet) {
+            std::printf("  Removed from ufw: UDP %s\n", link_port.c_str());
+          }
           break;
         case Firewall::kFirewalld:
-          for (const char *source : kAllowedSources) {
-            const std::string family = std::string(source).find(':') != std::string::npos ? "ipv6" : "ipv4";
+          for (const auto &source : sources) {
+            const std::string family = source.find(':') != std::string::npos ? "ipv6" : "ipv4";
             for (const unsigned short each : {port, kMdnsPort}) {
+              if (allow && tailscale_only && each == kMdnsPort) {
+                continue;  // discovery doesn't cross Tailscale
+              }
               const std::string rule = "rule family=\"" + family + "\" source address=\"" + source + "\" port port=\"" + std::to_string(each) +
                                        "\" protocol=\"udp\" accept";
-              run_tool({"firewall-cmd", "--permanent", (allow ? "--add-rich-rule=" : "--remove-rich-rule=") + rule});
+              std::string output;  // a warning for a rule that isn't there
+              run_tool({"firewall-cmd", "--permanent", (allow ? "--add-rich-rule=" : "--remove-rich-rule=") + rule}, allow ? nullptr : &output);
             }
           }
           run_tool({"firewall-cmd", "--reload"});
-          std::printf("  %s firewalld: UDP %s and mDNS from the local network and Tailscale\n", allow ? "Allowed in" : "Removed from",
-                      link_port.c_str());
+          if (!quiet && allow) {
+            std::printf("  Allowed in firewalld: UDP %s%s from %s\n", link_port.c_str(), tailscale_only ? "" : " and mDNS", from);
+          } else if (!quiet) {
+            std::printf("  Removed from firewalld: UDP %s and mDNS\n", link_port.c_str());
+          }
           break;
         case Firewall::kNone:
-          if (allow) {
-            std::printf("  No active ufw or firewalld found. If another firewall runs, allow UDP %s from the local network.\n", link_port.c_str());
+          if (allow && !quiet) {
+            std::printf("  No active ufw or firewalld found. If another firewall runs, allow UDP %s from %s.\n", link_port.c_str(), from);
           }
           break;
       }
+    }
+
+    /** The port install last opened in the firewall (the default if it never did). */
+    unsigned short recorded_firewall_port() {
+      unsigned short port = 48150;
+      std::ifstream port_file((fs::path(kDataDir) / kFirewallPortFile).string());
+      unsigned int value = 0;
+      if (port_file >> value && value > 0 && value <= 65535) {
+        port = static_cast<unsigned short>(value);
+      }
+      return port;
     }
 
     // --- A PNG writer, just enough for the icon (stored, uncompressed) --------
@@ -939,6 +999,11 @@ namespace inputline::desktop {
     return fs::exists(kUnitPath, error);
   }
 
+  bool service_active() {
+    std::string state;  // "active", "activating", "inactive", "failed"...
+    return service_installed() && run_tool({"systemctl", "is-active", kServiceUnit}, &state) >= 0 && state.rfind("activ", 0) == 0;
+  }
+
   int run_service(const std::function<int()> &serve, const std::function<void()> &) {
     return serve();  // systemd stops it with SIGTERM
   }
@@ -1018,10 +1083,28 @@ namespace inputline::desktop {
                fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read);
     std::printf("  Tray icon: at every sign-in (InputLine in the application menu shows it again if hidden)\n");
 
-    change_firewall(options.port, true);
+    // The firewall: from the local network and Tailscale, or Tailscale only.
+    // Without --tailscale-only or --allow-local-network, keep the last choice.
+    const fs::path scope_file = fs::path(kDataDir) / kFirewallScopeFile;
+    std::string scope = options.firewall;
+    if (scope.empty()) {
+      std::ifstream in(scope_file.string());
+      in >> scope;
+    }
+    const bool tailscale_only = scope == "tailscale";
+    if (fs::exists(fs::path(kDataDir) / kFirewallPortFile, error)) {
+      change_firewall(recorded_firewall_port(), false, false, true);  // what an earlier install allowed
+    }
+    change_firewall(options.port, true, tailscale_only);
+    if (tailscale_only) {
+      std::printf("    (only devices on your Tailscale network can connect; to allow the local network again:\n"
+                  "     sudo inputline-host install --allow-local-network)\n");
+    }
     {
-      std::ofstream port_file((fs::path(kDataDir) / "firewall-port").string(), std::ios::trunc);
+      std::ofstream port_file((fs::path(kDataDir) / kFirewallPortFile).string(), std::ios::trunc);
       port_file << options.port << "\n";
+      std::ofstream scope_out(scope_file.string(), std::ios::trunc);
+      scope_out << (tailscale_only ? "tailscale" : "local") << "\n";
     }
 
     // The service: starts with the system, restarts if it stops.
@@ -1042,6 +1125,16 @@ namespace inputline::desktop {
       "ExecStart=" + std::string(kInstalledBinary) + " service\n"
       "Restart=on-failure\n"
       "RestartSec=3\n"
+      // Limits that leave everything it does working: loading vhci-hcd,
+      // plugging controllers in through usbip, writing /var/lib/inputline,
+      // notifications and the tray icon in signed-in users' sessions.
+      "ProtectSystem=full\n"
+      "ProtectControlGroups=yes\n"
+      "ProtectKernelLogs=yes\n"
+      "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n"
+      "RestrictSUIDSGID=yes\n"
+      "RestrictRealtime=yes\n"
+      "LockPersonality=yes\n"
       "\n"
       "[Install]\n"
       "WantedBy=multi-user.target\n";
@@ -1079,16 +1172,8 @@ namespace inputline::desktop {
     run_tool({"systemctl", "daemon-reload"});
     std::printf("Removed the InputLine service\n");
 
-    unsigned short port = 48150;
-    {
-      std::ifstream port_file((fs::path(kDataDir) / "firewall-port").string());
-      unsigned int value = 0;
-      if (port_file >> value && value > 0 && value <= 65535) {
-        port = static_cast<unsigned short>(value);
-      }
-    }
-    change_firewall(port, false);
-    fs::remove(fs::path(kDataDir) / "firewall-port", error);
+    change_firewall(recorded_firewall_port(), false, false);
+    fs::remove(fs::path(kDataDir) / kFirewallPortFile, error);  // the scope is kept, like the options
     fs::remove(kModulesLoadPath, error);
     fs::remove(kUdevRulePath, error);
     run_tool({"udevadm", "control", "--reload-rules"});

@@ -39,7 +39,7 @@ sudo ./inputline-host install
 - sets it up as the **inputline** systemd service: it starts with the system, runs in the background, and restarts by itself if something goes wrong,
 - loads `vhci-hcd` now and at every boot,
 - adds a udev rule so Steam, running as you, can open the virtual controller,
-- allows UDP port 48150 in **ufw** or **firewalld**, from your local network and Tailscale only (CachyOS uses ufw),
+- allows UDP port 48150 in **ufw** or **firewalld**, from your local network and Tailscale only (CachyOS uses ufw; for Tailscale only, see [Tighter security](#tighter-security-optional)),
 - shows the **InputLine icon** in your desktop's tray, now and at every sign-in (see below),
 - ends with a short checklist of anything still missing.
 
@@ -104,8 +104,15 @@ sudo systemctl restart inputline         # so the service notices
 
 They're kept in `/var/lib/inputline/pairing`, which only root can read.
 
-**Updating:** download the new release and run `sudo ./inputline-host install` from it again. Paired devices and options are kept.
+**Updating:** download the new release and run `sudo ./inputline-host install` from it again. Paired devices, options and the firewall choice below are kept.
 **Uninstalling:** `sudo inputline-host uninstall`. Paired devices and options stay in `/var/lib/inputline` and `/etc/inputline` in case you install again; delete those folders to remove them too.
+
+## Tighter security (optional)
+
+Out of the box, any device on your local network or Tailscale can reach InputLine and ask for a pairing code. It still needs the code shown on your screen to pair, and everything is encrypted. To narrow it down:
+
+- **Tailscale only:** `sudo inputline-host install --tailscale-only`. Devices on your local network can't reach InputLine any more, so the app connects through Tailscale, also at home. To undo it: `sudo inputline-host install --allow-local-network`.
+- **No pairing from the couch:** add `--no-remote-pairing` to `/etc/inputline/options.txt` and run `sudo systemctl restart inputline`. To pair a new device later, run `sudo systemctl stop inputline`, then `sudo inputline-host pair`, and type the code it shows into InputLine. Once it says it's paired, press Ctrl+C and run `sudo systemctl start inputline`.
 
 ## Troubleshooting
 
