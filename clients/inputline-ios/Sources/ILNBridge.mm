@@ -7,6 +7,7 @@
 #import "ILNDiscovery.h"
 #import "ILNTritonBLE.h"
 
+#import <Network/Network.h>
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
 
@@ -21,6 +22,7 @@
 #include <mach/mach_time.h>
 #include <memory>
 #include <netdb.h>
+#include <optional>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -32,6 +34,16 @@ namespace {
     const NSTimeInterval kTickInterval = 0.02;
     const NSTimeInterval kProbeRetry = 0.5;
     const NSTimeInterval kNotFoundAfter = 3.0;
+    // Still no answer: open the sockets again, and look names up again.
+    const NSTimeInterval kReopenProbesAfter = 10.0;
+    // At home the PC can answer both directly and through Tailscale; the
+    // direct path is faster, so it gets this long to answer first.
+    const NSTimeInterval kPreferDirectFor = 0.25;
+    // Network changes come in bursts: act once it has settled.
+    const NSTimeInterval kNetworkSettle = 0.25;
+    // After the network changed, how long the PC has to answer on the new one
+    // before InputLine looks for it at every address it knows.
+    const NSTimeInterval kNetworkCheckTimeout = 1.5;
     const NSTimeInterval kPairRetry = 1.0;
     const NSTimeInterval kHelloRetry = 0.5;
     const int kMaxHelloAttempts = 6;
@@ -58,12 +70,11 @@ namespace {
     NSString *const kAddressDefaultsKey = @"ILNPCAddress";
     NSString *const kDisconnectedDefaultsKey = @"ILNDisconnectedFromPC";  // the user tapped Disconnect
     // Every address a PC answered on (home network, VPN...), newest first, by
-    // host name; and the host last connected to. When the saved address stops
-    // answering, the others are tried in turn.
+    // host name; and the host last connected to. All of them are tried at
+    // once, with the saved address.
     NSString *const kKnownAddressesDefaultsKey = @"ILNKnownAddresses";
     NSString *const kLastHostDefaultsKey = @"ILNLastHost";
     const NSUInteger kMaxKnownAddresses = 4;
-    const NSTimeInterval kTryNextAddressAfter = 9.0;
     NSString *const kRestoreIdentifier = @"com.evimore.InputLine.bluetooth";
     NSString *const kControllersDefaultsKey = @"ILNControllers";
 
@@ -128,6 +139,59 @@ namespace {
         return false;
     }
 
+    /// The socket addresses for a host and port: numbers only (no lookup), or any.
+    NSArray<NSData *> *ResolveAddress(NSString *host, NSString *port, bool numericOnly)
+    {
+        struct addrinfo hints = {};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = numericOnly ? AI_NUMERICHOST : 0;
+        struct addrinfo *info = NULL;
+        NSMutableArray<NSData *> *addresses = [NSMutableArray array];
+        if (getaddrinfo(host.UTF8String, port.UTF8String, &hints, &info) == 0) {
+            for (struct addrinfo *entry = info; entry != NULL; entry = entry->ai_next) {
+                [addresses addObject:[NSData dataWithBytes:entry->ai_addr length:entry->ai_addrlen]];
+            }
+            freeaddrinfo(info);
+        }
+        return addresses;
+    }
+
+    /// "Wi-Fi", "cellular, utun4"... for the event log.
+    NSString *NetworkDescription(nw_path_t path)
+    {
+        if (nw_path_get_status(path) != nw_path_status_satisfied) {
+            return @"no network";
+        }
+        NSMutableArray<NSString *> *names = [NSMutableArray array];
+        nw_path_enumerate_interfaces(path, ^bool(nw_interface_t interface) {
+            NSString *name = nil;
+            switch (nw_interface_get_type(interface)) {
+                case nw_interface_type_wifi:
+                    name = @"Wi-Fi";
+                    break;
+                case nw_interface_type_cellular:
+                    name = @"cellular";
+                    break;
+                case nw_interface_type_wired:
+                    name = @"wired";
+                    break;
+                case nw_interface_type_loopback:
+                    break;
+                default: {  // a VPN, for example
+                    const char *interfaceName = nw_interface_get_name(interface);
+                    name = interfaceName != NULL ? [NSString stringWithUTF8String:interfaceName] : nil;
+                    break;
+                }
+            }
+            if (name != nil && ![names containsObject:name]) {
+                [names addObject:name];
+            }
+            return true;
+        });
+        return names.count > 0 ? [names componentsJoinedByString:@", "] : @"connected";
+    }
+
     /// "host", "host:port", "[v6]", "[v6]:port" or a bare IPv6 address.
     void SplitAddress(NSString *address, NSString **host, NSString **port)
     {
@@ -188,6 +252,46 @@ namespace {
 @implementation ILNController
 @end
 
+#pragma mark - Sockets
+
+/// A UDP socket connected to one of the PC's addresses. Link queue.
+@interface ILNLinkSocket : NSObject
+@property (nonatomic, copy) NSString *address;  // as typed, remembered or discovered
+@property (nonatomic, copy) NSData *peer;       // what it resolved to
+@property (nonatomic, assign) int fd;           // -1 once shut
+@property (nonatomic, assign) BOOL viaTailscale;
+@property (nonatomic, strong, nullable) dispatch_source_t readSource;
+- (void)shut;
+@end
+
+@implementation ILNLinkSocket
+
+- (instancetype)init
+{
+    if ((self = [super init])) {
+        _fd = -1;
+    }
+    return self;
+}
+
+- (void)shut
+{
+    if (_readSource != nil) {
+        dispatch_source_cancel(_readSource);  // its cancel handler closes the socket
+        _readSource = nil;
+    } else if (_fd >= 0) {
+        close(_fd);
+    }
+    _fd = -1;
+}
+
+- (void)dealloc
+{
+    [self shut];
+}
+
+@end
+
 #pragma mark - ILNBridge
 
 @interface ILNBridge () <ILNTritonBLEDelegate, ILNDiscoveryDelegate>
@@ -196,16 +300,27 @@ namespace {
 @implementation ILNBridge {
     dispatch_queue_t _queue;
     dispatch_source_t _timer;
-    dispatch_source_t _readSource;
-    int _socket;
     ILNTritonBLE *_ble;
     ILNDiscovery *_discovery;               // main thread
     NSArray<ILNDiscoveredPC *> *_discovered;  // link queue
 
-    NSString *_address;       // the one being tried
+    NSString *_address;       // where the PC answered, or the saved address while searching
     NSString *_savedAddress;  // the user's choice, or where the PC last answered
-    NSUInteger _candidateIndex;
-    CFAbsoluteTime _nextAddressTry;
+    ILNLinkSocket *_link;     // to _address, once the PC answered there
+    // While searching: a socket to each address the PC may be at, the names
+    // being looked up, and a PC's answer through Tailscale while the direct
+    // addresses get a moment to answer too.
+    NSMutableDictionary<NSString *, ILNLinkSocket *> *_probes;
+    NSMutableSet<NSString *> *_resolving;
+    NSUInteger _probeGeneration;
+    CFAbsoluteTime _reopenProbesAt;
+    std::optional<link::ProbeReply> _heldReply;
+    ILNLinkSocket *_heldReplySocket;
+    CFAbsoluteTime _heldReplyUntil;
+    nw_path_monitor_t _pathMonitor;
+    NSString *_network;                  // the network's description, for the event log
+    CFAbsoluteTime _networkChangedAt;    // 0: no change to handle
+    CFAbsoluteTime _checkingLinkSince;   // the network changed while connected: 0 once the PC answered
     NSString *_hostName;
     NSString *_clientName;  // read once on the main thread
     ILNLinkState _state;
@@ -241,7 +356,6 @@ namespace {
     TimingStats _timingBackground;
     TimingStats _timingLive;
     TimingStats _timingSent;  // when reports actually leave for the PC
-    BOOL _viaTailscale;
     NSString *_lastEvent;
     NSUInteger _eventRepeats;
     CFAbsoluteTime _liveStarted;
@@ -265,7 +379,8 @@ namespace {
 - (instancetype)initPrivate
 {
     if ((self = [super init])) {
-        _socket = -1;
+        _probes = [NSMutableDictionary dictionary];
+        _resolving = [NSMutableSet set];
         _setupTask = UIBackgroundTaskInvalid;
         _rttMs = -1;
         _controllers = [NSMutableDictionary dictionary];
@@ -303,9 +418,9 @@ namespace {
         [self logEvent:launchedInBackground ? @"InputLine started in the background (iOS launched it for a controller)"
                                             : @"InputLine started"];
         if (self->_address.length > 0 && self->_state != ILNLinkStateDisconnected) {
-            [self openSocket];
             [self enterState:ILNLinkStateSearching];
         }
+        [self watchNetwork];
         self->_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self->_queue);
         dispatch_source_set_timer(self->_timer, DISPATCH_TIME_NOW, (uint64_t)(kTickInterval * NSEC_PER_SEC), NSEC_PER_MSEC);
         __weak ILNBridge *weakSelf = self;
@@ -345,16 +460,14 @@ namespace {
         self->_versionProblem = nil;
         self->_updateNote = nil;
         self->_savedAddress = trimmed;
-        self->_candidateIndex = 0;
         self->_hostName = nil;
         self->_session.reset();
         self->_everConnected = NO;
-        [self closeSocket];
+        [self closeLink];
         if (trimmed.length == 0) {
             [self enterState:ILNLinkStateNoPC];
             return;
         }
-        [self openSocket];
         [self enterState:ILNLinkStateSearching];
     });
 }
@@ -372,7 +485,7 @@ namespace {
         }
         self->_session.reset();
         self->_pendingPairRequest.clear();
-        [self closeSocket];
+        [self closeLink];
         [self enterState:ILNLinkStateDisconnected];
         [self logEvent:@"Disconnected from the PC: the controller works with this device until you tap Connect"];
     });
@@ -402,6 +515,7 @@ namespace {
     dispatch_async(_queue, ^{
         self->_discovered = pcs;
         [self useDiscoveredPairedPC];
+        [self probeNewCandidates];
     });
 }
 
@@ -412,12 +526,12 @@ namespace {
     });
 }
 
-/// If the saved address doesn't answer (or there is none) and a PC this
-/// device is paired with shows up on the network, switch to it. This covers
-/// a PC whose local address changed. Link queue.
+/// If there is no saved address and a PC this device is paired with shows up
+/// on the network, connect to it. (While searching, such a PC is tried along
+/// with the known addresses: see candidateAddresses.) Link queue.
 - (void)useDiscoveredPairedPC
 {
-    if (_state != ILNLinkStateNoPC && _state != ILNLinkStateNotFound) {
+    if (_state != ILNLinkStateNoPC) {
         return;
     }
     for (ILNDiscoveredPC *pc in _discovered) {
@@ -433,7 +547,8 @@ namespace {
 
 #pragma mark - Known addresses
 
-/// The saved address first, then the others the last PC answered on. Link queue.
+/// Where to look for the PC: the saved address, the others the last PC
+/// answered on, and paired PCs found on this network. Link queue.
 - (NSArray<NSString *> *)candidateAddresses
 {
     NSMutableArray<NSString *> *candidates = [NSMutableArray array];
@@ -450,28 +565,13 @@ namespace {
             }
         }
     }
+    for (ILNDiscoveredPC *pc in _discovered) {
+        link::Pairing pairing;
+        if (![candidates containsObject:pc.address] && [ILNBridge pairingForHostName:pc.name into:pairing]) {
+            [candidates addObject:pc.address];
+        }
+    }
     return candidates;
-}
-
-/// The current address doesn't answer: move on to the next known one. Link queue.
-- (void)tryNextKnownAddress
-{
-    NSArray<NSString *> *candidates = [self candidateAddresses];
-    if (candidates.count < 2) {
-        return;
-    }
-    _candidateIndex = (_candidateIndex + 1) % candidates.count;
-    NSString *next = candidates[_candidateIndex];
-    if ([next isEqualToString:_address]) {
-        return;
-    }
-    [self logEvent:[NSString stringWithFormat:@"Trying %@, where the PC answered before", next]];
-    _address = next;
-    _hostName = nil;
-    _session.reset();
-    [self closeSocket];
-    [self openSocket];
-    [self enterState:ILNLinkStateSearching];
 }
 
 /// Connected: keep this address for the PC and make it the saved one. Link queue.
@@ -493,7 +593,6 @@ namespace {
     [defaults setObject:_hostName forKey:kLastHostDefaultsKey];
     [defaults setObject:_address forKey:kAddressDefaultsKey];
     _savedAddress = _address;
-    _candidateIndex = 0;
 }
 
 #pragma mark - App state
@@ -516,6 +615,7 @@ namespace {
         self->_inBackground = NO;
         self->_timingForeground.break_sequence();
         [self logEvent:@"App back in the foreground"];
+        [self kickLink];
     });
 }
 
@@ -534,7 +634,7 @@ namespace {
         status.linkText = [self linkText];
         status.linkUp = self->_state == ILNLinkStateConnected || (self->_state == ILNLinkStateConnecting && self->_everConnected);
         status.updateText = self->_updateNote ?: @"";
-        status.viaTailscale = self->_viaTailscale;
+        status.viaTailscale = self->_link.viaTailscale;
         status.problemText = self->_state == ILNLinkStateNotFound ? [self linkText] : @"";
         NSMutableArray<NSString *> *controllers = [NSMutableArray array];
         NSMutableArray<ILNControllerInfo *> *infos = [NSMutableArray array];
@@ -587,7 +687,7 @@ namespace {
         case ILNLinkStateConnecting:
             return [NSString stringWithFormat:@"Connecting to %@...", _hostName ?: _address];
         case ILNLinkStateConnected: {
-            NSString *path = _viaTailscale ? @" through Tailscale" : @"";
+            NSString *path = _link.viaTailscale ? @" through Tailscale" : @"";
             return _rttMs >= 0 ? [NSString stringWithFormat:@"Connected to %@%@ (round trip %.1f ms)", _hostName, path, _rttMs]
                                : [NSString stringWithFormat:@"Connected to %@%@", _hostName, path];
         }
@@ -705,91 +805,345 @@ namespace {
     [self storePairings:pairings];
 }
 
-#pragma mark - Socket (link queue)
+#pragma mark - Sockets (link queue)
 
-- (void)openSocket
+/// A socket connected to the first of @p peers this device has a route to.
+/// What it receives goes to handleDatagram:length:from:.
+- (nullable ILNLinkSocket *)socketTo:(NSArray<NSData *> *)peers address:(NSString *)address
 {
-    [self closeSocket];
-    NSString *host = nil;
-    NSString *port = nil;
-    SplitAddress(_address, &host, &port);
-
-    struct addrinfo hints = {};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    struct addrinfo *info = NULL;
-    if (host.length == 0 || getaddrinfo(host.UTF8String, port.UTF8String, &hints, &info) != 0 || info == NULL) {
-        [self logEvent:[NSString stringWithFormat:@"Cannot resolve %@", _address]];
-        return;
-    }
-    for (struct addrinfo *entry = info; entry != NULL; entry = entry->ai_next) {
-        const int s = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
-        if (s < 0) {
+    for (NSData *peer in peers) {
+        const struct sockaddr *destination = (const struct sockaddr *)peer.bytes;
+        const int fd = socket(destination->sa_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd < 0) {
             continue;
         }
-        if (connect(s, entry->ai_addr, entry->ai_addrlen) == 0) {
-            _socket = s;
-            _viaTailscale = IsTailscaleAddress(entry->ai_addr);
-            break;
+        if (connect(fd, destination, (socklen_t)peer.length) != 0) {
+            close(fd);
+            continue;
         }
-        close(s);
-    }
-    freeaddrinfo(info);
-    if (_socket < 0) {
-        return;
-    }
+        // Low latency beats throughput for these tiny datagrams.
+        const int serviceClass = NET_SERVICE_TYPE_VO;
+        setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceClass, sizeof(serviceClass));
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
-    // Low latency beats throughput for these tiny datagrams.
-    const int serviceClass = NET_SERVICE_TYPE_VO;
-    setsockopt(_socket, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceClass, sizeof(serviceClass));
-
-    fcntl(_socket, F_SETFL, fcntl(_socket, F_GETFL) | O_NONBLOCK);
-    const int fd = _socket;
-    _readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, _queue);
-    __weak ILNBridge *weakSelf = self;
-    dispatch_source_set_event_handler(_readSource, ^{
-        std::uint8_t buffer[link::kMaxDatagram + 1];
-        for (;;) {
-            const ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-            if (received <= 0) {
-                break;
+        ILNLinkSocket *linkSocket = [[ILNLinkSocket alloc] init];
+        linkSocket.address = address;
+        linkSocket.peer = peer;
+        linkSocket.fd = fd;
+        linkSocket.viaTailscale = IsTailscaleAddress(destination);
+        dispatch_source_t readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, _queue);
+        __weak ILNBridge *weakSelf = self;
+        __weak ILNLinkSocket *weakSocket = linkSocket;
+        dispatch_source_set_event_handler(readSource, ^{
+            std::uint8_t buffer[link::kMaxDatagram + 1];
+            for (;;) {
+                const ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+                ILNLinkSocket *from = weakSocket;
+                if (received <= 0 || from == nil || from.fd < 0) {
+                    break;
+                }
+                [weakSelf handleDatagram:buffer length:(size_t)received from:from];
             }
-            [weakSelf handleDatagram:buffer length:(size_t)received];
-        }
-    });
-    dispatch_source_set_cancel_handler(_readSource, ^{
-        close(fd);
-    });
-    dispatch_resume(_readSource);
+        });
+        dispatch_source_set_cancel_handler(readSource, ^{
+            close(fd);
+        });
+        linkSocket.readSource = readSource;
+        dispatch_resume(readSource);
+        return linkSocket;
+    }
+    return nil;
 }
 
-- (void)closeSocket
+- (void)closeLink
 {
-    if (_readSource != nil) {
-        dispatch_source_cancel(_readSource);  // the cancel handler closes the socket
-        _readSource = nil;
-    } else if (_socket >= 0) {
-        close(_socket);
+    [_link shut];
+    _link = nil;
+}
+
+/// A fresh socket to the same address: after the network changed, or when
+/// iOS invalidated the old one while the app was suspended.
+- (void)reopenLink
+{
+    if (_link == nil) {
+        return;
     }
-    _socket = -1;
+    ILNLinkSocket *fresh = [self socketTo:@[_link.peer] address:_link.address];
+    [_link shut];
+    if (fresh != nil) {
+        _link = fresh;
+    }  // else no route right now: the next send tries again
 }
 
 - (void)sendDatagram:(const std::vector<std::uint8_t> &)datagram
 {
-    if (datagram.empty()) {
+    if (datagram.empty() || _link == nil) {
         return;
     }
-    if (_socket < 0) {
-        [self openSocket];
-        if (_socket < 0) {
+    if (_link.fd < 0) {
+        [self reopenLink];
+        if (_link.fd < 0) {
             return;
         }
     }
     _lastDatagramSent = CFAbsoluteTimeGetCurrent();
-    if (send(_socket, datagram.data(), datagram.size(), 0) < 0 && errno != EAGAIN && errno != ENOBUFS) {
+    if (send(_link.fd, datagram.data(), datagram.size(), 0) < 0 && errno != EAGAIN && errno != ENOBUFS) {
         // iOS can invalidate sockets of apps that were suspended; start over.
         [self logEvent:[NSString stringWithFormat:@"Network send failed (%s); reopening the socket", strerror(errno)]];
-        [self openSocket];
+        [self reopenLink];
+    }
+}
+
+#pragma mark - Looking for the PC (link queue)
+
+/// Probe every address the PC may be at, all at once; the first PC to answer
+/// is the one to use (see handleProbeReply:).
+- (void)startProbing
+{
+    [self stopProbing];
+    [self closeLink];
+    if (_savedAddress.length > 0) {
+        _address = _savedAddress;  // until the PC answers somewhere
+    }
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    _reopenProbesAt = now + kReopenProbesAfter;
+    _lastSend = now;  // each socket sends its first probe as soon as it's open
+    NSArray<NSString *> *candidates = [self candidateAddresses];
+    if (candidates.count > 1) {
+        [self logEvent:[NSString stringWithFormat:@"Link: trying %@", [candidates componentsJoinedByString:@", "]]];
+    }
+    for (NSString *address in candidates) {
+        [self probeAddress:address];
+    }
+}
+
+- (void)stopProbing
+{
+    ++_probeGeneration;  // drops lookups still running
+    for (ILNLinkSocket *probe in _probes.allValues) {
+        [probe shut];
+    }
+    [_probes removeAllObjects];
+    [_resolving removeAllObjects];
+    _heldReply.reset();
+    _heldReplySocket = nil;
+}
+
+/// While searching: also try addresses that became known since it started.
+- (void)probeNewCandidates
+{
+    if (_state != ILNLinkStateSearching && _state != ILNLinkStateNotFound) {
+        return;
+    }
+    for (NSString *address in [self candidateAddresses]) {
+        if (_probes[address] == nil && ![_resolving containsObject:address]) {
+            [self probeAddress:address];
+        }
+    }
+}
+
+- (void)probeAddress:(NSString *)address
+{
+    NSString *host = nil;
+    NSString *port = nil;
+    SplitAddress(address, &host, &port);
+    if (host.length == 0) {
+        return;
+    }
+    NSArray<NSData *> *numeric = ResolveAddress(host, port, true);
+    if (numeric.count > 0) {
+        [self addProbe:address peers:numeric];
+        return;
+    }
+    // A name can take seconds to look up, or to fail (a VPN name while the
+    // VPN is off): look it up elsewhere, so the other addresses go ahead.
+    [_resolving addObject:address];
+    const NSUInteger generation = _probeGeneration;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NSData *> *resolved = ResolveAddress(host, port, false);
+        dispatch_async(self->_queue, ^{
+            if (generation != self->_probeGeneration) {
+                return;
+            }
+            [self->_resolving removeObject:address];
+            if (resolved.count == 0) {
+                [self logEvent:[NSString stringWithFormat:@"Cannot resolve %@", address]];
+                return;
+            }
+            [self addProbe:address peers:resolved];
+        });
+    });
+}
+
+- (void)addProbe:(NSString *)address peers:(NSArray<NSData *> *)peers
+{
+    ILNLinkSocket *probe = [self socketTo:peers address:address];
+    if (probe == nil) {
+        return;  // no route to it from this network
+    }
+    _probes[address] = probe;
+    const auto datagram = link::ClientSession::make_probe(_probeNonce);
+    send(probe.fd, datagram.data(), datagram.size(), 0);
+}
+
+- (void)sendProbes
+{
+    const auto datagram = link::ClientSession::make_probe(_probeNonce);
+    for (ILNLinkSocket *probe in _probes.allValues) {
+        send(probe.fd, datagram.data(), datagram.size(), 0);  // fails quietly where there's no route
+    }
+}
+
+- (BOOL)probingDirectAddress
+{
+    for (ILNLinkSocket *probe in _probes.allValues) {
+        if (!probe.viaTailscale) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// A PC answered at one of the addresses being tried.
+- (void)handleProbeReply:(const std::uint8_t *)data length:(size_t)length from:(ILNLinkSocket *)socket
+{
+    const auto reply = link::ClientSession::parse_probe_reply(data, length, _probeNonce);
+    if (!reply) {
+        return;
+    }
+    // Pairing only ever starts at the saved address. At the others, only a PC
+    // this device is paired with counts: another network can have another
+    // PC at the same address.
+    if (![socket.address isEqualToString:_savedAddress]) {
+        link::Pairing pairing;
+        NSString *hostName = reply->host_name.empty() ? socket.address : ToNSString(reply->host_name);
+        if (![ILNBridge pairingForHostName:hostName into:pairing]) {
+            return;
+        }
+    }
+    if (socket.viaTailscale && [self probingDirectAddress]) {
+        if (!_heldReply) {
+            _heldReply = *reply;
+            _heldReplySocket = socket;
+            _heldReplyUntil = CFAbsoluteTimeGetCurrent() + kPreferDirectFor;
+        }
+        return;
+    }
+    [self useProbeReply:*reply from:socket];
+}
+
+/// Go ahead with the PC that answered at @p socket's address.
+- (void)useProbeReply:(const link::ProbeReply &)reply from:(ILNLinkSocket *)socket
+{
+    _hostName = ToNSString(reply.host_name);
+    if (_hostName.length == 0) {
+        _hostName = socket.address;
+    }
+    NSString *hostVersion = reply.software_version.empty() ? @"an older version" : ToNSString(reply.software_version);
+    NSString *problem = nil;
+    switch (link::check_compatibility(reply)) {
+        case link::Compatibility::kUpdateHost:
+            problem = [NSString stringWithFormat:@"%@ runs InputLine %@, which is older than this app. Install the latest InputLine on the PC.", _hostName, hostVersion];
+            break;
+        case link::Compatibility::kUpdateClient:
+            problem = [NSString stringWithFormat:@"%@ runs InputLine %@, which needs a newer version of this app. Update the app.", _hostName, hostVersion];
+            break;
+        case link::Compatibility::kCompatible:
+            break;
+    }
+    if (problem != nil) {
+        if (![problem isEqualToString:_versionProblem]) {
+            [self logEvent:problem];
+        }
+        _versionProblem = problem;
+        _state = ILNLinkStateNotFound;  // keep probing: it connects once updated
+        return;
+    }
+    _versionProblem = nil;
+    [self noteVersionOfPC:reply.software_version];
+    [self logEvent:[NSString stringWithFormat:@"Link: %@ answered at %@ after %.1f s", _hostName, socket.address,
+                                              CFAbsoluteTimeGetCurrent() - _stateEnteredAt]];
+
+    // From now on, talk to the PC at this address only.
+    [_probes removeObjectForKey:socket.address];
+    [self stopProbing];
+    [self closeLink];
+    _link = socket;
+    _address = socket.address;
+    link::Pairing pairing;
+    if ([ILNBridge pairingForHostName:_hostName into:pairing]) {
+        [self startSessionWithPairing:pairing];
+    } else {
+        [self beginPairing];
+    }
+}
+
+/// Something suggests the PC may be reachable now (a controller just
+/// connected, the app came to the front): try it at once, not at the next retry.
+- (void)kickLink
+{
+    switch (_state) {
+        case ILNLinkStateNotFound:
+            [self startProbing];  // fresh sockets: the network may have changed meanwhile
+            break;
+        case ILNLinkStateSearching:
+        case ILNLinkStateConnecting:
+            _lastSend = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+#pragma mark - Network changes (link queue)
+
+- (void)watchNetwork
+{
+    _pathMonitor = nw_path_monitor_create();
+    nw_path_monitor_set_queue(_pathMonitor, _queue);
+    __weak ILNBridge *weakSelf = self;
+    nw_path_monitor_set_update_handler(_pathMonitor, ^(nw_path_t path) {
+        [weakSelf networkDidChange:path];
+    });
+    nw_path_monitor_start(_pathMonitor);
+}
+
+/// The first call describes the network InputLine started on.
+- (void)networkDidChange:(nw_path_t)path
+{
+    NSString *network = NetworkDescription(path);
+    if (_network == nil) {
+        [self logEvent:[NSString stringWithFormat:@"Network: %@", network]];
+    } else {
+        [self logEvent:[NSString stringWithFormat:@"Network changed: %@", network]];
+        _networkChangedAt = CFAbsoluteTimeGetCurrent();  // service handles it once it has settled
+    }
+    _network = network;
+}
+
+/// The device moved to another network (Wi-Fi to cellular, a VPN on or off):
+/// sockets may be stale, and the PC may answer at another address now.
+- (void)handleNetworkChange
+{
+    switch (_state) {
+        case ILNLinkStateSearching:
+        case ILNLinkStateNotFound:
+        case ILNLinkStateConnecting:
+            [self enterState:ILNLinkStateSearching];
+            break;
+        case ILNLinkStatePairing:
+            [self reopenLink];
+            break;
+        case ILNLinkStateConnected:
+            // Keep the session if the PC still answers at this address (it
+            // follows this device's new one); otherwise look for it.
+            [self reopenLink];
+            _checkingLinkSince = CFAbsoluteTimeGetCurrent();
+            _lastPing = 0;
+            break;
+        case ILNLinkStateNoPC:
+        case ILNLinkStateDisconnected:
+            break;
     }
 }
 
@@ -809,10 +1163,14 @@ namespace {
     _state = state;
     _stateEnteredAt = CFAbsoluteTimeGetCurrent();
     _lastSend = 0;
+    _checkingLinkSince = 0;
+    if (state != ILNLinkStateSearching) {
+        [self stopProbing];
+    }
     switch (state) {
         case ILNLinkStateSearching:
             _probeNonce = RandomNonce();
-            _nextAddressTry = _stateEnteredAt + kTryNextAddressAfter;
+            [self startProbing];
             break;
         case ILNLinkStateConnecting:
             _helloAttempts = 0;
@@ -846,6 +1204,10 @@ namespace {
         [self enterState:ILNLinkStateConnecting];
     }
     _lastService = now;
+    if (_networkChangedAt > 0 && now - _networkChangedAt >= kNetworkSettle) {
+        _networkChangedAt = 0;
+        [self handleNetworkChange];
+    }
     const CFAbsoluteTime inState = now - _stateEnteredAt;
     if (now - _lastBatteryRead >= kBatteryReadInterval) {
         _lastBatteryRead = now;
@@ -861,18 +1223,25 @@ namespace {
 
         case ILNLinkStateSearching:
         case ILNLinkStateNotFound:
+            if (_heldReply && now >= _heldReplyUntil) {
+                // Only Tailscale answered: go with it.
+                const link::ProbeReply reply = *_heldReply;
+                ILNLinkSocket *socket = _heldReplySocket;
+                _heldReply.reset();
+                _heldReplySocket = nil;
+                [self useProbeReply:reply from:socket];
+                break;
+            }
             if (_state == ILNLinkStateSearching && inState > kNotFoundAfter) {
                 _state = ILNLinkStateNotFound;  // keep the nonce; keep probing
-                [self logEvent:[NSString stringWithFormat:@"Link: no answer from %@ yet", _address]];
-                [self useDiscoveredPairedPC];
+                [self logEvent:[NSString stringWithFormat:@"Link: no answer from %@ yet", [[self candidateAddresses] componentsJoinedByString:@", "]]];
             }
-            if (_state == ILNLinkStateNotFound && now >= _nextAddressTry) {
-                _nextAddressTry = now + kTryNextAddressAfter;
-                [self tryNextKnownAddress];
+            if (_state == ILNLinkStateNotFound && now >= _reopenProbesAt) {
+                [self startProbing];
             }
             if (now - _lastSend >= (_state == ILNLinkStateNotFound ? 2.0 : kProbeRetry)) {
                 _lastSend = now;
-                [self sendDatagram:link::ClientSession::make_probe(_probeNonce)];
+                [self sendProbes];
             }
             break;
 
@@ -906,6 +1275,14 @@ namespace {
             break;
 
         case ILNLinkStateConnected:
+            if (_checkingLinkSince > 0 && _lastPong >= _checkingLinkSince) {
+                _checkingLinkSince = 0;  // still there after the network changed
+            }
+            if (_checkingLinkSince > 0 && now - _checkingLinkSince > kNetworkCheckTimeout) {
+                [self logEvent:@"Link: no answer from the PC on this network; looking for it"];
+                [self enterState:ILNLinkStateSearching];
+                break;
+            }
             if (now - _lastPong > kLinkLostAfter) {
                 [self logEvent:@"Link: no answer from the PC for 4 s, reconnecting"];
                 [self enterState:ILNLinkStateConnecting];
@@ -951,49 +1328,19 @@ namespace {
     }
 }
 
-- (void)handleDatagram:(const std::uint8_t *)data length:(size_t)length
+- (void)handleDatagram:(const std::uint8_t *)data length:(size_t)length from:(ILNLinkSocket *)socket
 {
+    if (_state == ILNLinkStateSearching || _state == ILNLinkStateNotFound) {
+        [self handleProbeReply:data length:length from:socket];
+        return;
+    }
+    if (socket != _link) {
+        return;  // a probe socket on its way out
+    }
     switch (_state) {
         case ILNLinkStateSearching:
-        case ILNLinkStateNotFound: {
-            const auto reply = link::ClientSession::parse_probe_reply(data, length, _probeNonce);
-            if (!reply) {
-                return;
-            }
-            _hostName = ToNSString(reply->host_name);
-            if (_hostName.length == 0) {
-                _hostName = _address;
-            }
-            NSString *hostVersion = reply->software_version.empty() ? @"an older version" : ToNSString(reply->software_version);
-            NSString *problem = nil;
-            switch (link::check_compatibility(*reply)) {
-                case link::Compatibility::kUpdateHost:
-                    problem = [NSString stringWithFormat:@"%@ runs InputLine %@, which is older than this app. Install the latest InputLine on the PC.", _hostName, hostVersion];
-                    break;
-                case link::Compatibility::kUpdateClient:
-                    problem = [NSString stringWithFormat:@"%@ runs InputLine %@, which needs a newer version of this app. Update the app.", _hostName, hostVersion];
-                    break;
-                case link::Compatibility::kCompatible:
-                    break;
-            }
-            if (problem != nil) {
-                if (![problem isEqualToString:_versionProblem]) {
-                    [self logEvent:problem];
-                }
-                _versionProblem = problem;
-                _state = ILNLinkStateNotFound;  // keep probing: it connects once updated
-                return;
-            }
-            _versionProblem = nil;
-            [self noteVersionOfPC:reply->software_version];
-            link::Pairing pairing;
-            if ([ILNBridge pairingForHostName:_hostName into:pairing]) {
-                [self startSessionWithPairing:pairing];
-            } else {
-                [self beginPairing];
-            }
+        case ILNLinkStateNotFound:
             return;
-        }
 
         case ILNLinkStatePairing: {
             if (_pendingPairRequest.empty()) {
@@ -1290,7 +1637,7 @@ namespace {
     dispatch_async(_queue, ^{
         if (self->_state == ILNLinkStatePairing) {
             // Try again later by tapping Connect.
-            [self closeSocket];
+            [self closeLink];
             [self enterState:ILNLinkStateNoPC];  // Connect tries again
         }
     });
@@ -1399,6 +1746,7 @@ namespace {
         controller.mouseModeOn = YES;
         [self identify:controller];
         [controller.device readBattery];  // a report sent during setup arrived before this
+        [self kickLink];
         [self service];
     });
 }

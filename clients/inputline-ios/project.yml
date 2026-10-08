@@ -26,6 +26,9 @@ targets:
       - path: ../../core/src
       - path: ../../core/include
         buildPhase: none
+    dependencies:
+      # Not linked automatically from Objective-C++ (ILNBridge.mm watches network changes).
+      - sdk: Network.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.evimore.InputLine
