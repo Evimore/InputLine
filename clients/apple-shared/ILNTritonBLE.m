@@ -25,7 +25,7 @@ static NSString *const kBatteryService = @"180F";
 static NSString *const kBatteryLevelCharacteristic = @"2A19";
 static const uint8_t kBatteryReportId = 0x43;
 static const size_t kBatteryReportPayload = 14;  // TritonBatteryStatus_t
-// EChargeState
+// EChargeState (0, "reset", is no measurement: sent right after connecting)
 static const uint8_t kChargeStateDischarging = 1;
 static const uint8_t kChargeStateCharging = 2;
 static const uint8_t kChargeStateSourceCheck = 3;  // checking the power source it was just plugged into
@@ -75,6 +75,8 @@ static void TritonLog(id<ILNTritonBLEDelegate> delegate, NSString *message)
 @property (nonatomic, strong, nullable) CBCharacteristic *batteryReportCharacteristic;
 @property (nonatomic, strong, nullable) CBCharacteristic *batteryLevelCharacteristic;
 @property (nonatomic, assign) BOOL batteryFromReport;  // Valve's report seen: ignore the plain level
+@property (nonatomic, assign) NSInteger standardBatteryLevel;  // the Battery Service's level, -1 until known
+@property (nonatomic, assign) BOOL batteryReportLogged;  // this connection's first battery report went to the event log
 @property (nonatomic, assign) NSInteger batteryLevel;
 @property (nonatomic, assign) BOOL batteryCharging;
 @property (nonatomic, assign) CFAbsoluteTime setupStartedAt;  // 0 while not connected
@@ -97,6 +99,7 @@ static void TritonLog(id<ILNTritonBLEDelegate> delegate, NSString *message)
         _delegate = delegate;
         _outputCharacteristics = [NSMutableDictionary dictionary];
         _batteryLevel = -1;
+        _standardBatteryLevel = -1;
         peripheral.delegate = self;
     }
     return self;
@@ -131,6 +134,8 @@ static void TritonLog(id<ILNTritonBLEDelegate> delegate, NSString *message)
     self.batteryReportCharacteristic = nil;
     self.batteryLevelCharacteristic = nil;
     self.batteryFromReport = NO;
+    self.standardBatteryLevel = -1;
+    self.batteryReportLogged = NO;
     self.notifyResult = nil;
     self.setupStartedAt = CFAbsoluteTimeGetCurrent();
     [self.peripheral discoverServices:@[[CBUUID UUIDWithString:kValveService], [CBUUID UUIDWithString:kBatteryService]]];
@@ -406,17 +411,41 @@ static void TritonLog(id<ILNTritonBLEDelegate> delegate, NSString *message)
         if (bytes[0] == kBatteryReportId && value.length >= kBatteryReportPayload + 1) {
             bytes += 1;
         }
+        // Not a measurement: a charge state of 0 ("reset", right after
+        // connecting) or no battery voltage. Not believed either: 0% while
+        // the standard battery level says otherwise.
+        const BOOL measured = bytes[0] >= kChargeStateDischarging && bytes[0] <= kChargeStateFull && (bytes[2] | bytes[3]) != 0;
+        const BOOL contradicted = bytes[1] == 0 && self.standardBatteryLevel > 10;
+        NSString *verdict = !measured    ? @", not a measurement: ignored"
+                          : contradicted ? [NSString stringWithFormat:@", but the standard level says %ld%%: ignored", (long)self.standardBatteryLevel]
+                                         : @"";
+        if (!self.batteryReportLogged || verdict.length > 0) {
+            // The raw bytes, to see what the controller sends.
+            NSMutableString *hex = [NSMutableString string];
+            for (size_t i = 0; i < kBatteryReportPayload; ++i) {
+                [hex appendFormat:@"%02x", bytes[i]];
+            }
+            TritonLog(self.delegate, [NSString stringWithFormat:@"Bluetooth: %@ battery report %@%@", self.name, hex, verdict]);
+            self.batteryReportLogged = YES;
+        }
+        if (verdict.length > 0) {
+            return;
+        }
         self.batteryFromReport = YES;
         [self deliverBatteryReport:bytes];
     } else if (characteristic == self.batteryLevelCharacteristic) {
         NSData *value = characteristic.value;
-        if (error != nil || value.length < 1 || self.batteryFromReport) {
+        if (error != nil || value.length < 1) {
+            return;
+        }
+        self.standardBatteryLevel = MIN(((const uint8_t *)value.bytes)[0], (uint8_t)100);
+        if (self.batteryFromReport) {
             return;
         }
         // Only a percentage: report it as discharging, with no voltages.
         uint8_t payload[kBatteryReportPayload] = {0};
         payload[0] = kChargeStateDischarging;
-        payload[1] = MIN(((const uint8_t *)value.bytes)[0], (uint8_t)100);
+        payload[1] = (uint8_t)self.standardBatteryLevel;
         [self deliverBatteryReport:payload];
     } else if (characteristic == self.reportCharacteristic) {
         void (^pending)(NSData *) = self.pendingFeatureRead;
