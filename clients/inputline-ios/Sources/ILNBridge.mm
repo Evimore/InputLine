@@ -77,6 +77,18 @@ namespace {
     const NSUInteger kMaxKnownAddresses = 4;
     NSString *const kRestoreIdentifier = @"com.evimore.InputLine.bluetooth";
     NSString *const kControllersDefaultsKey = @"ILNControllers";
+    // What each controller said about itself (serial, firmware attributes), by
+    // identifier: used when it doesn't answer in time after a reconnect.
+    NSString *const kIdentitiesDefaultsKey = @"ILNControllerIdentities";
+    // How long to keep asking a controller who it is before plugging it in on
+    // the PC: longest for its serial when it's new (Steam keys its settings
+    // by it), shorter once the serial is known or what it said last time is.
+    const NSTimeInterval kIdentifyFor = 10.0;
+    const NSTimeInterval kIdentifyForKnown = 3.0;
+    const NSTimeInterval kIdentifyRetry = 0.25;
+    // GET_STRING_ATTRIBUTE (0xAE) index 1, the unit serial; GET_ATTRIBUTES_VALUES (0x83).
+    const std::uint8_t kSerialRequest[] = {0x01, 0xAE, 0x01, 0x01};
+    const std::uint8_t kAttributesRequest[] = {0x01, 0x83, 0x00};
 
     const std::uint8_t kSettingLizardMode = 9;
 
@@ -117,6 +129,24 @@ namespace {
     NSString *ToNSString(const std::string &text)
     {
         return [NSString stringWithUTF8String:text.c_str()] ?: @"";
+    }
+
+    /** The unit serial in a GET_STRING_ATTRIBUTE reply, or nil. */
+    NSString *SerialFromReply(NSData *reply)
+    {
+        const std::uint8_t *bytes = (const std::uint8_t *)reply.bytes;
+        if (reply.length <= 4 || bytes[1] != 0xAE || bytes[3] != 0x01) {
+            return nil;
+        }
+        NSString *serial = [[NSString alloc] initWithBytes:bytes + 4 length:strnlen((const char *)bytes + 4, reply.length - 4) encoding:NSASCIIStringEncoding];
+        return serial.length > 0 ? serial : nil;
+    }
+
+    /** A GET_ATTRIBUTES_VALUES reply (report ID first), or nil. */
+    NSData *AttributesFromReply(NSData *reply)
+    {
+        const std::uint8_t *bytes = (const std::uint8_t *)reply.bytes;
+        return reply.length > 3 && bytes[1] == 0x83 ? reply : nil;
     }
 
     NSData *SettingReport(std::uint8_t setting, std::uint16_t value)
@@ -233,6 +263,8 @@ namespace {
 @property (nonatomic, copy, nullable) NSString *serial;
 @property (nonatomic, copy, nullable) NSData *attributes;
 @property (nonatomic, assign) BOOL identified;
+@property (nonatomic, assign) CFAbsoluteTime identifyStarted;
+@property (nonatomic, copy, nullable) NSDictionary *rememberedIdentity;  // what it said last time
 @property (nonatomic, assign) BOOL attached;
 @property (nonatomic, assign) CFAbsoluteTime lastAttachSent;
 @property (nonatomic, assign) CFAbsoluteTime lastLizardSent;
@@ -1672,47 +1704,103 @@ namespace {
     }
 }
 
-- (void)identify:(ILNController *)controller
+/// What this controller said about itself last time, or nil.
+- (nullable NSDictionary *)rememberedIdentityOf:(NSUUID *)identifier
 {
-    [self identify:controller attempt:1];
+    id entry = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kIdentitiesDefaultsKey][identifier.UUIDString];
+    if (![entry isKindOfClass:[NSDictionary class]] || ![entry[@"serial"] isKindOfClass:[NSString class]] ||
+        ![entry[@"attributes"] isKindOfClass:[NSData class]]) {
+        return nil;
+    }
+    return entry;
 }
 
-- (void)identify:(ILNController *)controller attempt:(int)attempt
+- (void)rememberIdentity:(ILNController *)controller
 {
-    // GET_STRING_ATTRIBUTE (0xAE) index 1: the unit serial, which Steam keys
-    // settings by and the PC uses to recognise the controller after a drop.
-    const std::uint8_t serialRequest[] = {0x01, 0xAE, 0x01, 0x01};
-    __weak ILNController *weakController = controller;
-    [controller.device queryFeatureReport:[NSData dataWithBytes:serialRequest length:sizeof(serialRequest)] completion:^(NSData *reply) {
-        NSString *serial = nil;
-        const std::uint8_t *bytes = (const std::uint8_t *)reply.bytes;
-        if (reply.length > 4 && bytes[1] == 0xAE && bytes[3] == 0x01) {
-            serial = [[NSString alloc] initWithBytes:bytes + 4 length:strnlen((const char *)bytes + 4, reply.length - 4) encoding:NSASCIIStringEncoding];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *identities = [NSMutableDictionary dictionary];
+    // Only for the controllers InputLine remembers (rememberController:).
+    NSDictionary *old = [defaults dictionaryForKey:kIdentitiesDefaultsKey];
+    for (NSString *known in [defaults stringArrayForKey:kControllersDefaultsKey]) {
+        if (old[known] != nil) {
+            identities[known] = old[known];
         }
-        // A controller that just woke up may not answer yet: ask again, so
-        // the PC recognises it and gives it back its old virtual controller.
-        if (serial.length == 0 && attempt < 3 && weakController != nil) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), self->_queue, ^{
-                ILNController *strong = weakController;
-                if (strong != nil) {
-                    [self identify:strong attempt:attempt + 1];
+    }
+    identities[controller.device.identifier.UUIDString] = @{@"serial": controller.serial, @"attributes": controller.attributes};
+    [defaults setObject:identities forKey:kIdentitiesDefaultsKey];
+}
+
+/// Ask the controller who it is: its unit serial, which Steam keys its
+/// settings by and the PC uses to recognise it after a drop, and its firmware
+/// version, which Steam compares with its own. It isn't plugged in on the PC
+/// until then. A controller that just woke up can take a few seconds to
+/// answer; if it doesn't, what it said last time is used, so Steam doesn't
+/// see another controller with old firmware. Link queue.
+- (void)identify:(ILNController *)controller
+{
+    controller.identifyStarted = CFAbsoluteTimeGetCurrent();
+    controller.rememberedIdentity = [self rememberedIdentityOf:controller.device.identifier];
+    [self identifyStep:controller];
+}
+
+- (void)identifyStep:(ILNController *)controller
+{
+    if (controller.identified || _controllers[controller.device.identifier] != controller) {
+        return;  // done, or the controller went away
+    }
+    const NSTimeInterval limit = controller.rememberedIdentity != nil || controller.serial != nil ? kIdentifyForKnown : kIdentifyFor;
+    if ((controller.serial != nil && controller.attributes != nil) || CFAbsoluteTimeGetCurrent() - controller.identifyStarted >= limit) {
+        [self finishIdentify:controller];
+        return;
+    }
+    const BOOL askSerial = controller.serial == nil;
+    NSData *request = askSerial ? [NSData dataWithBytes:kSerialRequest length:sizeof(kSerialRequest)]
+                                : [NSData dataWithBytes:kAttributesRequest length:sizeof(kAttributesRequest)];
+    __weak ILNController *weakController = controller;
+    [controller.device queryFeatureReport:request completion:^(NSData *reply) {
+        dispatch_async(self->_queue, ^{
+            ILNController *strong = weakController;
+            if (strong == nil) {
+                return;
+            }
+            NSString *serial = askSerial ? SerialFromReply(reply) : nil;
+            NSData *attributes = askSerial ? nil : AttributesFromReply(reply);
+            if (serial != nil || attributes != nil) {
+                if (serial != nil) {
+                    strong.serial = serial;
+                } else {
+                    strong.attributes = attributes;
+                }
+                [self identifyStep:strong];
+                return;
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kIdentifyRetry * NSEC_PER_SEC)), self->_queue, ^{
+                ILNController *again = weakController;
+                if (again != nil) {
+                    [self identifyStep:again];
                 }
             });
-            return;
-        }
-        // GET_ATTRIBUTES_VALUES (0x83): the firmware version Steam compares against.
-        const std::uint8_t attributesRequest[] = {0x01, 0x83, 0x00};
-        [weakController.device queryFeatureReport:[NSData dataWithBytes:attributesRequest length:sizeof(attributesRequest)] completion:^(NSData *attributes) {
-            const std::uint8_t *a = (const std::uint8_t *)attributes.bytes;
-            NSData *valid = (attributes.length > 3 && a[1] == 0x83) ? attributes : nil;
-            dispatch_async(self->_queue, ^{
-                ILNController *strong = weakController;
-                strong.serial = serial;
-                strong.attributes = valid;
-                strong.identified = YES;
-            });
-        }];
+        });
     }];
+}
+
+/// Plug it in with what it said, filled in from last time if it didn't say everything. Link queue.
+- (void)finishIdentify:(ILNController *)controller
+{
+    NSDictionary *remembered = controller.rememberedIdentity;
+    NSString *name = controller.device.name;
+    if (controller.serial != nil && controller.attributes != nil) {
+        [self rememberIdentity:controller];
+    } else if (remembered != nil && (controller.serial == nil || [controller.serial isEqualToString:remembered[@"serial"]])) {
+        [self logEvent:[NSString stringWithFormat:@"%@ didn't say %@ in time: using what it said last time", name,
+                                                  controller.serial == nil ? @"who it is" : @"its firmware version"]];
+        controller.serial = controller.serial ?: remembered[@"serial"];
+        controller.attributes = controller.attributes ?: remembered[@"attributes"];
+    } else {
+        [self logEvent:[NSString stringWithFormat:@"%@ didn't say %@ in time: Steam may see it as another controller", name,
+                                                  controller.serial == nil ? @"who it is" : @"its firmware version"]];
+    }
+    controller.identified = YES;
 }
 
 #pragma mark - ILNTritonBLEDelegate (Bluetooth queue)
