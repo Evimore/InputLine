@@ -71,6 +71,7 @@ namespace {
     bool discovery = true;
     bool update_check = true;
     bool hide_console = false;
+    std::string firewall;  // install: "tailscale", "local", or empty to keep the last choice
     std::string log_file;
     int stats_seconds = 0;
     std::set<std::uint8_t> blocked_settings {kSettingWirelessPacketVersion};
@@ -114,6 +115,10 @@ namespace {
       "  --pin CODE       With 'pair': use this code instead of a random one\n"
       "  --no-remote-pairing  Only pair through 'inputline-host pair'\n"
       "  --no-discovery   Don't announce this PC on the local network\n"
+#ifndef _WIN32
+      "  --tailscale-only With 'install': let only devices on your Tailscale network\n"
+      "                   through the firewall (kept until --allow-local-network)\n"
+#endif
       "  --no-update-check  (Service) Don't check GitHub for a newer InputLine\n"
       "  --log PATH       Write the log to a file\n"
       "  --stats          Log report timing every 10 s (rate, gaps)\n"
@@ -206,6 +211,10 @@ namespace {
         args.update_check = false;
       } else if (arg == "--hide-console") {
         args.hide_console = true;
+      } else if (arg == "--tailscale-only") {
+        args.firewall = "tailscale";
+      } else if (arg == "--allow-local-network") {
+        args.firewall = "local";
       } else if (arg == "--stats") {
         args.stats_seconds = 10;
       } else if (arg == "--block-setting" || arg == "--allow-setting") {
@@ -404,6 +413,16 @@ namespace {
     const auto status = path.empty() ? std::nullopt : read_status_file(path);
     const auto now = static_cast<std::int64_t>(std::time(nullptr));
     if (!status || now - status->time > 15 || status->time - now > 15) {
+      if (desktop::service_active()) {
+        // It writes its status a moment after it starts, and every 2 s from then on.
+        std::printf("The InputLine service is running but hasn't reported its status yet. If it just started, try again in a few seconds.\n");
+#ifdef _WIN32
+        std::printf("Log: %s\n", desktop::data_file("inputline-host.log").c_str());
+#else
+        std::printf("Log: journalctl -u inputline\n");
+#endif
+        return 1;
+      }
       std::printf("The InputLine service isn't running.\n");
 #ifdef _WIN32
       std::printf("Start it from Terminal (Admin): Start-Service InputLine\n");
@@ -520,9 +539,16 @@ namespace {
 
   int run_command(Arguments &args) {
     if (args.command == "install") {
+#ifdef _WIN32
+      if (!args.firewall.empty()) {
+        std::fprintf(stderr, "--tailscale-only and --allow-local-network are for Linux. On Windows, InputLine already lets only the local network and Tailscale through.\n");
+        return 2;
+      }
+#endif
       desktop::InstallOptions install;
       install.run_arguments = run_arguments(args);
       install.port = args.port;
+      install.firewall = args.firewall;
       return desktop::install(install);
     }
     if (args.command == "uninstall") {

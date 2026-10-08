@@ -70,6 +70,9 @@ namespace inputline::desktop {
   /** Whether the installer's InputLine service exists. */
   bool service_installed();
 
+  /** Whether the InputLine service is running or starting, as Windows or systemd see it. */
+  bool service_active();
+
   /**
    * @brief Run as the Windows service: serve() runs until stop() makes it
    *        return, which happens when Windows stops the service.
@@ -81,6 +84,8 @@ namespace inputline::desktop {
     /** Extra arguments for the installed 'run' command (port, config...). */
     std::vector<std::string> run_arguments;
     unsigned short port = 0;
+    /** Linux: "tailscale" (Tailscale only), "local" (the local network and Tailscale), or empty to keep the last choice. */
+    std::string firewall;
   };
 
   /**

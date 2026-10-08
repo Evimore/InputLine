@@ -333,6 +333,16 @@ jobs:
           # The service writes its status every 2 s.
           for i in $(seq 1 15); do inputline-host status && break; sleep 1; done
           inputline-host status | grep -q "usbip: ready"
+          # It runs with systemd's limits.
+          systemctl show inputline -p ProtectSystem -p RestrictSUIDSGID -p RestrictAddressFamilies | tee "$RUNNER_TEMP/limits.txt"
+          grep -q "ProtectSystem=full" "$RUNNER_TEMP/limits.txt"
+          grep -q "RestrictSUIDSGID=yes" "$RUNNER_TEMP/limits.txt"
+          # Right after a restart, before its first status, it isn't reported as stopped.
+          sudo systemctl restart inputline
+          inputline-host status > "$RUNNER_TEMP/restart-status.txt" || true
+          cat "$RUNNER_TEMP/restart-status.txt"
+          if grep -q "isn't running" "$RUNNER_TEMP/restart-status.txt"; then exit 1; fi
+          for i in $(seq 1 15); do inputline-host status && break; sleep 1; done
       - name: Found on the network (Avahi)
         run: |
           for i in $(seq 1 15); do
@@ -388,16 +398,34 @@ jobs:
           SCRIPT
           mkdir -p "$RUNNER_TEMP/home"
           RUNNER_TEMP="$RUNNER_TEMP" dbus-run-session -- bash "$RUNNER_TEMP/tray.sh"
+      - name: Firewall for Tailscale only
+        run: |
+          rules() { sudo ufw status | grep "48150/udp" || true; }
+          # (bash -e ignores a failing '! command' unless it comes last, hence the ifs.)
+          sudo inputline-host install --tailscale-only | tee "$RUNNER_TEMP/install-tailscale.txt"
+          grep -q "from Tailscale only" "$RUNNER_TEMP/install-tailscale.txt"
+          rules | tee "$RUNNER_TEMP/rules.txt"
+          grep -q "100.64.0.0/10" "$RUNNER_TEMP/rules.txt"
+          if grep -q "192.168.0.0/16" "$RUNNER_TEMP/rules.txt"; then exit 1; fi
+          # Installing again (an update) keeps the choice.
+          sudo inputline-host install > /dev/null
+          rules | tee "$RUNNER_TEMP/rules.txt"
+          if grep -q "192.168.0.0/16" "$RUNNER_TEMP/rules.txt"; then exit 1; fi
+          sudo inputline-host install --allow-local-network > /dev/null
+          rules | tee "$RUNNER_TEMP/rules.txt"
+          grep -q "192.168.0.0/16" "$RUNNER_TEMP/rules.txt"
+          grep -q "100.64.0.0/10" "$RUNNER_TEMP/rules.txt"
+          for i in $(seq 1 15); do inputline-host status && break; sleep 1; done
       - name: Uninstall
         run: |
           sudo inputline-host uninstall
-          ! systemctl is-active --quiet inputline
+          if systemctl is-active --quiet inputline; then exit 1; fi
           test ! -e /etc/systemd/system/inputline.service
           test ! -e /usr/local/bin/inputline-host
           test ! -e /etc/udev/rules.d/70-inputline.rules
           test ! -e /etc/xdg/autostart/inputline-tray.desktop
           test ! -e /usr/local/share/applications/inputline.desktop
-          ! sudo ufw status | grep -q "48150/udp"
+          if sudo ufw status | grep -q "48150/udp"; then exit 1; fi
           sudo test -f /var/lib/inputline/pairing/inputline-host.conf
       - name: Logs
         if: always()
