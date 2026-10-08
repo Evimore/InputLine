@@ -41,7 +41,7 @@
 ## Next
 
 - [ ] Find which setting makes the controller drop Bluetooth when Steam restarts or changes a config, and stop passing it on (setting 49 is already blocked)
-- [ ] iPhone with a real 2026 Steam Controller: notification rate and jitter, background with the screen locked
+- [ ] iPhone with a real 2026 Steam Controller: works end to end with Fedora, also in the background (reported by a tester); still to check: long sessions with the screen locked
 - [ ] Apple TV through an iPhone bridge
 - [ ] Settle whether Steam uses the IMU quaternion in report `0x42`. If it does, compute orientation host-side from gyro and accel instead of sending identity.
 - [ ] Haptics end to end: trackpad clicks and rumble felt on the controller

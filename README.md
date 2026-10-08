@@ -16,7 +16,7 @@ Steam Link is the only streaming app that brings the Steam Controller across wit
 - **Easy to live with:** the PC side runs in the background (a Windows installer, or one command on Linux); the app finds your PC on the network and reconnects the controller by itself.
 - **Free and open source.**
 
-> **Status: public beta.** It works end to end on one setup so far: a 2026 Steam Controller, an iPad and a Windows 11 PC. Steam shows full Steam Input, every input works, and it feels the same as Steam Link. iPhone, Apple TV (through an iPhone) and Windows 10 haven't been tested yet. If you try InputLine, please [say how it went](../../issues/new/choose), whether it worked or not. The app isn't on the App Store yet, so you install it yourself (free, from Windows). See the [roadmap](docs/roadmap.md).
+> **Status: public beta.** It works end to end with a 2026 Steam Controller on Windows 11 and Linux (CachyOS, Fedora), with an iPad or an iPhone. Steam shows full Steam Input, every input works, and it feels the same as Steam Link. Apple TV (through an iPhone) and Windows 10 haven't been tested yet, nor long sessions with an iPhone's screen locked. If you try InputLine, please [say how it went](../../issues/new/choose), whether it worked or not. The app isn't on the App Store yet, so you install it yourself (free, from Windows). See the [roadmap](docs/roadmap.md).
 
 ```
  iPad / iPhone                                        PC
