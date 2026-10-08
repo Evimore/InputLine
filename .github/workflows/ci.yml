@@ -31,17 +31,24 @@ jobs:
             cc: gcc
             cxx: g++
             flags: -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+            # Also check core/'s crypto against libsodium (a test only).
+            cross_check: "ON"
           - name: clang, TSan
             cc: clang
             cxx: clang++
             flags: -fsanitize=thread
+            cross_check: "OFF"
     steps:
       - uses: actions/checkout@v4
+      - name: Install libsodium (for the crypto cross-check)
+        if: matrix.cross_check == 'ON'
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
       - name: Configure
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           "-DCMAKE_CXX_FLAGS=${{ matrix.flags }}"
+          -DINPUTLINE_CROSS_CHECK=${{ matrix.cross_check }}
       - name: Build
         run: cmake --build build -j
       - name: Test
